@@ -20,6 +20,13 @@ def _short_tool_id() -> str:
 class GeminiNativeProvider(LLMProvider):
     """LLM provider using google-genai SDK directly for custom Gemini endpoints."""
 
+    # Proxy endpoints often need more retries for transient capacity issues.
+    _CHAT_RETRY_DELAYS = (1, 2, 4, 8, 16)
+    _TRANSIENT_ERROR_MARKERS = LLMProvider._TRANSIENT_ERROR_MARKERS + (
+        "accounts exhausted",
+        "capacity",
+    )
+
     def __init__(
         self,
         api_key: str = "",
@@ -101,6 +108,8 @@ class GeminiNativeProvider(LLMProvider):
                     for tc in tool_calls:
                         func = tc.get("function", {})
                         name = func.get("name", "")
+                        # Alias names so history matches what _convert_tools declared
+                        name = self._TOOL_NAME_ALIASES.get(name, name)
                         args_raw = func.get("arguments", "{}")
                         args = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
                         parts.append({"function_call": {"name": name, "args": args}})
@@ -144,6 +153,11 @@ class GeminiNativeProvider(LLMProvider):
         system_instruction = "\n".join(system_parts) if system_parts else None
         return system_instruction, contents
 
+    # Tools whose names conflict with Gemini built-in tools.  We rename them
+    # before sending to the API and map back in the response.
+    _TOOL_NAME_ALIASES = {"web_search": "search_web"}
+    _TOOL_NAME_ALIASES_REV = {v: k for k, v in _TOOL_NAME_ALIASES.items()}
+
     def _convert_tools(
         self, tools: list[dict[str, Any]] | None
     ) -> list[dict[str, Any]] | None:
@@ -153,7 +167,10 @@ class GeminiNativeProvider(LLMProvider):
         declarations = []
         for tool in tools:
             func = tool.get("function", {})
-            decl: dict[str, Any] = {"name": func.get("name", "")}
+            name = func.get("name", "")
+            # Rename tools that clash with Gemini built-ins
+            name = self._TOOL_NAME_ALIASES.get(name, name)
+            decl: dict[str, Any] = {"name": name}
             if func.get("description"):
                 decl["description"] = func["description"]
             if func.get("parameters"):
@@ -177,6 +194,7 @@ class GeminiNativeProvider(LLMProvider):
         if isinstance(tool_choice, dict):
             func_name = tool_choice.get("function", {}).get("name")
             if func_name:
+                func_name = self._TOOL_NAME_ALIASES.get(func_name, func_name)
                 return {
                     "function_calling_config": {
                         "mode": "ANY",
@@ -208,6 +226,8 @@ class GeminiNativeProvider(LLMProvider):
                 fc = part.function_call
                 tc_id = _short_tool_id()
                 name = getattr(fc, "name", "") or ""
+                # Map aliased names back to the original tool name
+                name = self._TOOL_NAME_ALIASES_REV.get(name, name)
                 args = dict(getattr(fc, "args", {}) or {})
                 tool_calls.append(ToolCallRequest(id=tc_id, name=name, arguments=args))
                 self._tool_call_name_map[tc_id] = name
@@ -265,7 +285,7 @@ class GeminiNativeProvider(LLMProvider):
         if tool_config:
             config["tool_config"] = tool_config
         # Disable automatic function calling — nanobot manages the tool loop
-        config["automatic_function_calling"] = {"disable": True, "maximum_remote_calls": 0}
+        config["automatic_function_calling"] = {"disable": True}
 
         try:
             client = self._get_client()
