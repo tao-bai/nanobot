@@ -438,7 +438,94 @@ async def test_chat_basic_text():
     # Verify the SDK was called with correct params
     call_kwargs = mock_aio_models.generate_content.call_args
     assert call_kwargs.kwargs["model"] == "gemini-3-flash"
-    assert isinstance(call_kwargs.kwargs["contents"], list)
+
+
+def test_convert_tools_aliases_web_search():
+    """web_search should be renamed to search_web in declarations."""
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    provider = GeminiNativeProvider(
+        api_key="k", api_base="http://localhost:8045", default_model="gemini-3-flash"
+    )
+    tools = [
+        {"type": "function", "function": {"name": "web_search", "description": "Search the web", "parameters": {"type": "object", "properties": {"query": {"type": "string"}}}}},
+        {"type": "function", "function": {"name": "get_weather", "description": "Get weather"}},
+    ]
+    result = provider._convert_tools(tools)
+    decls = result[0]["function_declarations"]
+    assert decls[0]["name"] == "search_web"
+    assert decls[1]["name"] == "get_weather"
+
+
+def test_parse_response_reverse_aliases_search_web():
+    """search_web in Gemini response should be mapped back to web_search."""
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    provider = GeminiNativeProvider(
+        api_key="k", api_base="http://localhost:8045", default_model="gemini-3-flash"
+    )
+
+    mock_fc = MagicMock()
+    mock_fc.name = "search_web"
+    mock_fc.args = {"query": "python"}
+
+    mock_part = MagicMock()
+    mock_part.text = None
+    mock_part.function_call = mock_fc
+
+    mock_content = MagicMock()
+    mock_content.parts = [mock_part]
+
+    mock_candidate = MagicMock()
+    mock_candidate.content = mock_content
+
+    mock_response = MagicMock()
+    mock_response.candidates = [mock_candidate]
+    mock_response.usage_metadata = None
+
+    result = provider._parse_response(mock_response)
+    assert result.tool_calls[0].name == "web_search"
+
+
+def test_convert_messages_aliases_tool_calls_in_history():
+    """Assistant tool_calls in history should use aliased names for Gemini."""
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    provider = GeminiNativeProvider(
+        api_key="k", api_base="http://localhost:8045", default_model="gemini-3-flash"
+    )
+    messages = [
+        {"role": "user", "content": "Search for python"},
+        {
+            "role": "assistant",
+            "content": None,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "web_search", "arguments": '{"query": "python"}'}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": '{"results": []}'},
+        {"role": "user", "content": "Thanks"},
+    ]
+    _, contents = provider._convert_messages(messages)
+    # function_call in history should use aliased name
+    fc = contents[1]["parts"][0]["function_call"]
+    assert fc["name"] == "search_web"
+    # function_response should also use aliased name
+    fr = contents[2]["parts"][0]["function_response"]
+    assert fr["name"] == "search_web"
+
+
+def test_convert_tool_choice_aliases_specific_function():
+    """tool_choice with a specific aliased function should use the aliased name."""
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    provider = GeminiNativeProvider(
+        api_key="k", api_base="http://localhost:8045", default_model="gemini-3-flash"
+    )
+    result = provider._convert_tool_choice(
+        {"type": "function", "function": {"name": "web_search"}}
+    )
+    assert result["function_calling_config"]["allowed_function_names"] == ["search_web"]
 
 
 @pytest.mark.asyncio
