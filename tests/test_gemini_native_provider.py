@@ -585,3 +585,115 @@ async def test_chat_strips_gemini_prefix():
 
     call_kwargs = mock_aio_models.generate_content.call_args
     assert call_kwargs.kwargs["model"] == "gemini-3-flash"
+
+
+# --- _parse_data_uri tests ---
+
+def test_parse_data_uri_valid_jpeg():
+    from nanobot.providers.gemini_native_provider import _parse_data_uri
+
+    result = _parse_data_uri("data:image/jpeg;base64,/9j/4AAQ")
+    assert result == ("image/jpeg", "/9j/4AAQ")
+
+
+def test_parse_data_uri_valid_png():
+    from nanobot.providers.gemini_native_provider import _parse_data_uri
+
+    result = _parse_data_uri("data:image/png;base64,iVBORw0KGgo=")
+    assert result == ("image/png", "iVBORw0KGgo=")
+
+
+def test_parse_data_uri_invalid_inputs():
+    from nanobot.providers.gemini_native_provider import _parse_data_uri
+
+    assert _parse_data_uri("https://example.com/image.jpg") is None
+    assert _parse_data_uri("not a data uri") is None
+    assert _parse_data_uri("") is None
+
+
+# --- _convert_content_to_parts tests ---
+
+def test_convert_content_to_parts_string():
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    parts = GeminiNativeProvider._convert_content_to_parts("hello")
+    assert parts == [{"text": "hello"}]
+
+
+def test_convert_content_to_parts_none():
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    parts = GeminiNativeProvider._convert_content_to_parts(None)
+    assert parts == [{"text": ""}]
+
+
+def test_convert_content_to_parts_multimodal_with_image():
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    content = [
+        {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}},
+        {"type": "text", "text": "What is this?"},
+    ]
+    parts = GeminiNativeProvider._convert_content_to_parts(content)
+    assert len(parts) == 2
+    assert parts[0] == {"inline_data": {"mime_type": "image/jpeg", "data": "/9j/4AAQ"}}
+    assert parts[1] == {"text": "What is this?"}
+
+
+def test_convert_content_to_parts_image_only():
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    content = [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBOR"}},
+    ]
+    parts = GeminiNativeProvider._convert_content_to_parts(content)
+    assert len(parts) == 1
+    assert parts[0] == {"inline_data": {"mime_type": "image/png", "data": "iVBOR"}}
+
+
+def test_convert_content_to_parts_empty_list():
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    parts = GeminiNativeProvider._convert_content_to_parts([])
+    assert parts == [{"text": ""}]
+
+
+def test_convert_content_to_parts_non_data_uri_fallback():
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    content = [
+        {"type": "image_url", "image_url": {"url": "https://example.com/photo.jpg"}},
+    ]
+    parts = GeminiNativeProvider._convert_content_to_parts(content)
+    assert len(parts) == 1
+    assert parts[0] == {"text": "[image: https://example.com/photo.jpg]"}
+
+
+# --- _convert_messages multimodal integration test ---
+
+def test_convert_messages_multimodal_user_message():
+    """Multimodal user message with image produces correct inline_data parts."""
+    from nanobot.providers.gemini_native_provider import GeminiNativeProvider
+
+    provider = GeminiNativeProvider(
+        api_key="test-key",
+        api_base="http://localhost:8045",
+        default_model="gemini-3-flash",
+    )
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQ"}},
+                {"type": "text", "text": "Describe this image"},
+            ],
+        },
+    ]
+    system_instruction, contents = provider._convert_messages(messages)
+    assert system_instruction is None
+    assert len(contents) == 1
+    assert contents[0]["role"] == "user"
+    parts = contents[0]["parts"]
+    assert len(parts) == 2
+    assert parts[0] == {"inline_data": {"mime_type": "image/jpeg", "data": "/9j/4AAQ"}}
+    assert parts[1] == {"text": "Describe this image"}
