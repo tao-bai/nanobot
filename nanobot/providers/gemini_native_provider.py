@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 import string
 from typing import Any
@@ -10,6 +11,14 @@ from typing import Any
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
 
 _ALNUM = string.ascii_letters + string.digits
+
+_DATA_URI_RE = re.compile(r"^data:([^;]+);base64,(.+)$", re.DOTALL)
+
+
+def _parse_data_uri(data_uri: str) -> tuple[str, str] | None:
+    """Parse a data URI into (mime_type, base64_data) or None if invalid."""
+    m = _DATA_URI_RE.match(data_uri)
+    return (m.group(1), m.group(2)) if m else None
 
 
 def _short_tool_id() -> str:
@@ -73,6 +82,32 @@ class GeminiNativeProvider(LLMProvider):
             return model[len("gemini/"):]
         return model
 
+    @staticmethod
+    def _convert_content_to_parts(content: Any) -> list[dict[str, Any]]:
+        """Convert OpenAI-format content (str, list, or None) to Gemini-format parts."""
+        if isinstance(content, str):
+            return [{"text": content}]
+        if isinstance(content, list):
+            parts: list[dict[str, Any]] = []
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                item_type = item.get("type", "")
+                if item_type == "text":
+                    parts.append({"text": item.get("text", "")})
+                elif item_type == "image_url":
+                    url_info = item.get("image_url", {})
+                    url = url_info.get("url", "") if isinstance(url_info, dict) else ""
+                    parsed = _parse_data_uri(url)
+                    if parsed:
+                        mime_type, b64_data = parsed
+                        parts.append({"inline_data": {"mime_type": mime_type, "data": b64_data}})
+                    else:
+                        # Non-data-URI: text fallback
+                        parts.append({"text": f"[image: {url}]"})
+            return parts if parts else [{"text": ""}]
+        return [{"text": content or ""}]
+
     def _convert_messages(
         self, messages: list[dict[str, Any]]
     ) -> tuple[str | None, list[dict[str, Any]]]:
@@ -98,7 +133,7 @@ class GeminiNativeProvider(LLMProvider):
             if role == "user":
                 contents.append({
                     "role": "user",
-                    "parts": [{"text": content or ""}],
+                    "parts": self._convert_content_to_parts(content),
                 })
                 continue
 
