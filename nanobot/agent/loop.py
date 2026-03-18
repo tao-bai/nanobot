@@ -479,6 +479,10 @@ class AgentLoop:
 
         final_content = result.final_content
 
+        # Suppress duplicate: user already saw this text as a progress message
+        if final_content is not None and final_content == result.emitted_fallback_content:
+            final_content = None
+
         # Use fallback only if: final is empty AND fallback wasn't already sent as progress
         if final_content is None and result.fallback_content and result.fallback_content != result.emitted_fallback_content:
             final_content = result.fallback_content

@@ -406,6 +406,59 @@ class TestProgressGating:
         assert result is None
 
     @pytest.mark.asyncio
+    async def test_final_suppressed_when_identical_to_emitted_progress(self, tmp_path: Path) -> None:
+        """Final content identical to emitted progress -> suppressed (no duplicate)."""
+        config = ChannelsConfig(send_progress=True)
+        loop = _make_loop(tmp_path, channels_config=config)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content="Hello", tool_calls=[tool_call]),
+            LLMResponse(content="Hello", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        outbound: list[OutboundMessage] = []
+        loop.bus.publish_outbound = AsyncMock(side_effect=lambda m: outbound.append(m))
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Hi")
+        result = await loop._process_message(msg)
+
+        # Progress was sent via bus
+        progress_msgs = [m for m in outbound if m.metadata.get("_progress")]
+        assert len(progress_msgs) > 0
+        # Final suppressed because it's identical to emitted progress
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_final_not_suppressed_when_different_from_emitted_progress(self, tmp_path: Path) -> None:
+        """Final content differs from emitted progress -> not suppressed."""
+        config = ChannelsConfig(send_progress=True)
+        loop = _make_loop(tmp_path, channels_config=config)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content="Working...", tool_calls=[tool_call]),
+            LLMResponse(content="Here are the results", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        outbound: list[OutboundMessage] = []
+        loop.bus.publish_outbound = AsyncMock(side_effect=lambda m: outbound.append(m))
+
+        msg = InboundMessage(channel="feishu", sender_id="user1", chat_id="chat123", content="Hi")
+        result = await loop._process_message(msg)
+
+        # Progress was sent
+        progress_msgs = [m for m in outbound if m.metadata.get("_progress")]
+        assert len(progress_msgs) > 0
+        # Final NOT suppressed because content differs
+        assert result is not None
+        assert result.content == "Here are the results"
+
+    @pytest.mark.asyncio
     async def test_process_direct_no_bus_leak(self, tmp_path: Path) -> None:
         """process_direct with no callback -> no bus progress, fallback used."""
         loop = _make_loop(tmp_path)
