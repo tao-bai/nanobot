@@ -1556,7 +1556,7 @@ wheels = [
 
 [[package]]
 name = "nanobot-ai"
-version = "0.1.4.post4"
+version = "0.1.4.post5"
 source = { editable = "." }
 dependencies = [
     { name = "chardet" },
