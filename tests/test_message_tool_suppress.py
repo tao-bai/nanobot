@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop, RunLoopResult
+from nanobot.agent.loop import AgentLoop, RunLoopResult, _PROGRESS_ACK
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -442,3 +442,226 @@ class TestMessageToolTurnTracking:
         tool._sent_in_turn = True
         tool.start_turn()
         assert not tool._sent_in_turn
+
+
+class TestSyntheticAcknowledgment:
+    """Tests for synthetic user acknowledgment injection and stripping."""
+
+    @pytest.mark.asyncio
+    async def test_synthetic_injected_when_thought_emitted(self, tmp_path: Path) -> None:
+        """Synthetic ack is injected when on_progress fires with a thought."""
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content="I'll check that", tool_calls=[tool_call]),
+            LLMResponse(content="Here's what I found", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            pass
+
+        result = await loop._run_agent_loop([], on_progress=on_progress)
+
+        synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
+        assert len(synthetic_msgs) == 1
+        assert synthetic_msgs[0]["role"] == "user"
+        assert synthetic_msgs[0]["content"] == _PROGRESS_ACK
+
+    @pytest.mark.asyncio
+    async def test_no_synthetic_when_no_thought(self, tmp_path: Path) -> None:
+        """No synthetic ack when tool call has no thought (tool-hint-only progress)."""
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content=None, tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            pass
+
+        result = await loop._run_agent_loop([], on_progress=on_progress)
+
+        synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
+        assert len(synthetic_msgs) == 0
+
+    @pytest.mark.asyncio
+    async def test_no_synthetic_without_on_progress(self, tmp_path: Path) -> None:
+        """No synthetic ack when on_progress callback is None."""
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content="I'll check that", tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        result = await loop._run_agent_loop([])  # no on_progress
+
+        synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
+        assert len(synthetic_msgs) == 0
+
+    @pytest.mark.asyncio
+    async def test_synthetic_stripped_from_session(self, tmp_path: Path) -> None:
+        """Synthetic messages are not persisted in session history."""
+        from nanobot.session.manager import Session
+
+        loop = _make_loop(tmp_path)
+        session = Session(key="test:session")
+
+        messages = [
+            {"role": "user", "content": "Hello"},
+            {"role": "assistant", "content": "I'll check"},
+            {"role": "tool", "content": "result", "tool_call_id": "call1", "name": "read_file"},
+            {"role": "user", "content": _PROGRESS_ACK, "_synthetic": True},
+            {"role": "assistant", "content": "Here's the answer"},
+        ]
+
+        loop._save_turn(session, messages, 0)
+
+        saved_contents = [m.get("content") for m in session.messages]
+        assert _PROGRESS_ACK not in saved_contents
+        assert not any(m.get("_synthetic") for m in session.messages)
+        # Other messages should be saved
+        assert "Hello" in saved_contents
+        assert "Here's the answer" in saved_contents
+
+    @pytest.mark.asyncio
+    async def test_multi_round_each_gets_synthetic(self, tmp_path: Path) -> None:
+        """Each tool-call round with a thought gets its own synthetic ack."""
+        loop = _make_loop(tmp_path)
+        tc1 = ToolCallRequest(id="call1", name="read_file", arguments={"path": "a.txt"})
+        tc2 = ToolCallRequest(id="call2", name="read_file", arguments={"path": "b.txt"})
+        calls = iter([
+            LLMResponse(content="Checking A", tool_calls=[tc1]),
+            LLMResponse(content="Now checking B", tool_calls=[tc2]),
+            LLMResponse(content="All done", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            pass
+
+        result = await loop._run_agent_loop([], on_progress=on_progress)
+
+        synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
+        assert len(synthetic_msgs) == 2
+        for sm in synthetic_msgs:
+            assert sm["content"] == _PROGRESS_ACK
+
+    @pytest.mark.asyncio
+    async def test_multi_round_silent_round_no_synthetic(self, tmp_path: Path) -> None:
+        """Round with thought gets ack, silent round does not."""
+        loop = _make_loop(tmp_path)
+        tc1 = ToolCallRequest(id="call1", name="read_file", arguments={"path": "a.txt"})
+        tc2 = ToolCallRequest(id="call2", name="read_file", arguments={"path": "b.txt"})
+        calls = iter([
+            LLMResponse(content="Checking A", tool_calls=[tc1]),
+            LLMResponse(content=None, tool_calls=[tc2]),  # silent round
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            pass
+
+        result = await loop._run_agent_loop([], on_progress=on_progress)
+
+        synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
+        assert len(synthetic_msgs) == 1  # only round 1
+
+    @pytest.mark.asyncio
+    async def test_fallback_still_works_with_synthetic(self, tmp_path: Path) -> None:
+        """Fallback logic is unaffected by synthetic messages in the message list."""
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content="Looking it up", tool_calls=[tool_call]),
+            LLMResponse(content=None, tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            pass
+
+        result = await loop._run_agent_loop([], on_progress=on_progress)
+
+        # final_content is None (empty final response), fallback was emitted
+        assert result.final_content is None
+        assert result.fallback_content == "Looking it up"
+        assert result.emitted_fallback_content == "Looking it up"
+        # Synthetic ack should be present in messages
+        assert any(m.get("_synthetic") for m in result.messages)
+
+
+class TestDispatchTypingClear:
+    """Tests for typing indicator clearing on all channels."""
+
+    @pytest.mark.asyncio
+    async def test_empty_message_sent_on_non_cli_channel(self, tmp_path: Path) -> None:
+        """Empty message sent to clear typing even on non-CLI channels."""
+        loop = _make_loop(tmp_path)
+        # Make _process_message return None (no response)
+        loop._process_message = AsyncMock(return_value=None)
+
+        outbound: list[OutboundMessage] = []
+        loop.bus.publish_outbound = AsyncMock(side_effect=lambda m: outbound.append(m))
+
+        msg = InboundMessage(
+            channel="telegram", sender_id="user1", chat_id="chat123", content="Hi",
+        )
+        await loop._dispatch(msg)
+
+        assert len(outbound) == 1
+        assert outbound[0].channel == "telegram"
+        assert outbound[0].chat_id == "chat123"
+        assert outbound[0].content == ""
+
+    @pytest.mark.asyncio
+    async def test_empty_message_sent_on_cli_channel(self, tmp_path: Path) -> None:
+        """CLI channel still gets empty message (unchanged behavior)."""
+        loop = _make_loop(tmp_path)
+        loop._process_message = AsyncMock(return_value=None)
+
+        outbound: list[OutboundMessage] = []
+        loop.bus.publish_outbound = AsyncMock(side_effect=lambda m: outbound.append(m))
+
+        msg = InboundMessage(
+            channel="cli", sender_id="user1", chat_id="direct", content="Hi",
+        )
+        await loop._dispatch(msg)
+
+        assert len(outbound) == 1
+        assert outbound[0].content == ""
+
+    @pytest.mark.asyncio
+    async def test_response_published_when_not_none(self, tmp_path: Path) -> None:
+        """Normal response published instead of empty message."""
+        loop = _make_loop(tmp_path)
+        response = OutboundMessage(channel="telegram", chat_id="chat123", content="Hello!")
+        loop._process_message = AsyncMock(return_value=response)
+
+        outbound: list[OutboundMessage] = []
+        loop.bus.publish_outbound = AsyncMock(side_effect=lambda m: outbound.append(m))
+
+        msg = InboundMessage(
+            channel="telegram", sender_id="user1", chat_id="chat123", content="Hi",
+        )
+        await loop._dispatch(msg)
+
+        assert len(outbound) == 1
+        assert outbound[0].content == "Hello!"
