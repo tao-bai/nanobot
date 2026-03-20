@@ -46,6 +46,9 @@ class RunLoopResult:
     messages: list[dict] = field(default_factory=list)
 
 
+_PROGRESS_ACK = "[Your last message was shown to the user as a progress update. Don't repeat or paraphrase it. Only reply if you have new information to add.]"
+
+
 class AgentLoop:
     """
     The agent loop is the core processing engine.
@@ -257,6 +260,15 @@ class AgentLoop:
                     messages = self.context.add_tool_result(
                         messages, tool_call.id, tool_call.name, result
                     )
+
+                # Inject synthetic user ack so the LLM sees its thought was
+                # delivered and doesn't repeat it in the final response.
+                if on_progress and thought:
+                    messages.append({
+                        "role": "user",
+                        "content": _PROGRESS_ACK,
+                        "_synthetic": True,
+                    })
             else:
                 clean = self._strip_think(response.content)
                 # Don't persist error responses to session history — they can
@@ -365,15 +377,12 @@ class AgentLoop:
                 response = await self._process_message(msg)
                 if response is not None:
                     await self.bus.publish_outbound(response)
-                elif msg.channel in ("cli", "telegram", "discord"):
-                    await self.bus.publish_outbound(
-                        OutboundMessage(
-                            channel=msg.channel,
-                            chat_id=msg.chat_id,
-                            content="",
-                            metadata=msg.metadata or {},
-                        )
-                    )
+                else:
+                    # Send empty message to clear typing indicators on all channels
+                    await self.bus.publish_outbound(OutboundMessage(
+                        channel=msg.channel, chat_id=msg.chat_id,
+                        content="", metadata=msg.metadata or {},
+                    ))
             except asyncio.CancelledError:
                 logger.info("Task cancelled for session {}", msg.session_key)
                 raise
@@ -582,6 +591,8 @@ class AgentLoop:
         from datetime import datetime
 
         for m in messages[skip:]:
+            if m.get("_synthetic"):
+                continue  # don't persist synthetic acknowledgments
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
