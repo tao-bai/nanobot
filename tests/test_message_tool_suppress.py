@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from nanobot.agent.loop import AgentLoop, RunLoopResult, _PROGRESS_ACK
+from nanobot.agent.loop import AgentLoop
 from nanobot.agent.tools.message import MessageTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
 from nanobot.bus.queue import MessageBus
@@ -521,7 +521,8 @@ class TestSyntheticAcknowledgment:
         synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
         assert len(synthetic_msgs) == 1
         assert synthetic_msgs[0]["role"] == "user"
-        assert synthetic_msgs[0]["content"] == _PROGRESS_ACK
+        assert "Already delivered to user:" in synthetic_msgs[0]["content"]
+        assert "I'll check that" in synthetic_msgs[0]["content"]
 
     @pytest.mark.asyncio
     async def test_no_synthetic_when_no_thought(self, tmp_path: Path) -> None:
@@ -574,14 +575,14 @@ class TestSyntheticAcknowledgment:
             {"role": "user", "content": "Hello"},
             {"role": "assistant", "content": "I'll check"},
             {"role": "tool", "content": "result", "tool_call_id": "call1", "name": "read_file"},
-            {"role": "user", "content": _PROGRESS_ACK, "_synthetic": True},
+            {"role": "user", "content": "Already delivered to user:\n\"\"\"test\"\"\"", "_synthetic": True},
             {"role": "assistant", "content": "Here's the answer"},
         ]
 
         loop._save_turn(session, messages, 0)
 
         saved_contents = [m.get("content") for m in session.messages]
-        assert _PROGRESS_ACK not in saved_contents
+        assert not any("Already delivered to user:" in (c or "") for c in saved_contents)
         assert not any(m.get("_synthetic") for m in session.messages)
         # Other messages should be saved
         assert "Hello" in saved_contents
@@ -610,7 +611,7 @@ class TestSyntheticAcknowledgment:
         synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
         assert len(synthetic_msgs) == 2
         for sm in synthetic_msgs:
-            assert sm["content"] == _PROGRESS_ACK
+            assert "Already delivered to user:" in sm["content"]
 
     @pytest.mark.asyncio
     async def test_multi_round_silent_round_no_synthetic(self, tmp_path: Path) -> None:
@@ -718,3 +719,140 @@ class TestDispatchTypingClear:
 
         assert len(outbound) == 1
         assert outbound[0].content == "Hello!"
+
+
+class TestSemanticDuplicate:
+    """Tests for _is_semantic_duplicate fuzzy matching."""
+
+    def test_exact_match(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        assert loop._is_semantic_duplicate("Hello world", {"Hello world"})
+
+    def test_exact_match_with_whitespace(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        assert loop._is_semantic_duplicate("  Hello world  ", {"Hello world"})
+
+    def test_rephrased_opening_detected(self, tmp_path: Path) -> None:
+        """Rephrased intro with same body is detected as duplicate."""
+        loop = _make_loop(tmp_path)
+        progress = "Boss, nice walk! Here are food options: 1. Subway 2. Rice 3. GrabFood. Want me to help?"
+        final = "Boss, an hour of walking! Here are food options: 1. Subway 2. Rice 3. GrabFood. Want me to help?"
+        assert loop._is_semantic_duplicate(final, {progress})
+
+    def test_completely_different_not_suppressed(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        progress = "Let me search for nearby restaurants for you."
+        final = "Here are the search results: 1. McDonald's 2. Subway 3. KFC. All within 500m."
+        assert not loop._is_semantic_duplicate(final, {progress})
+
+    def test_short_progress_long_final_not_suppressed(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        progress = "Working on it..."
+        final = "I've analyzed the data and found three key trends: revenue up 20%, costs down 5%."
+        assert not loop._is_semantic_duplicate(final, {progress})
+
+    def test_short_string_exact_only(self, tmp_path: Path) -> None:
+        """Strings shorter than 20 chars use exact match only."""
+        loop = _make_loop(tmp_path)
+        assert loop._is_semantic_duplicate("OK", {"OK"})
+        assert not loop._is_semantic_duplicate("OK!", {"OK"})
+
+    def test_empty_candidate(self, tmp_path: Path) -> None:
+        loop = _make_loop(tmp_path)
+        assert not loop._is_semantic_duplicate("", {"something"})
+        assert not loop._is_semantic_duplicate("  ", {"something"})
+
+
+class TestLowValueFinalSuppression:
+    """Tests for low-value final suppression when progress was sent."""
+
+    @pytest.mark.asyncio
+    async def test_ok_suppressed_when_progress_sent(self, tmp_path: Path) -> None:
+        """Short 'OK' final is suppressed when progress was already sent."""
+        loop = _make_loop(tmp_path, channels_config=ChannelsConfig(send_progress=True))
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        calls = iter([
+            LLMResponse(content="Let me check that file for you", tool_calls=[tool_call]),
+            LLMResponse(content="OK", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="file content")
+
+        outbound: list[OutboundMessage] = []
+        loop.bus.publish_outbound = AsyncMock(side_effect=lambda m: outbound.append(m))
+
+        msg = InboundMessage(channel="telegram", sender_id="user1", chat_id="chat123", content="Hi")
+        result = await loop._process_message(msg)
+
+        # "OK" should be suppressed (low-value final with progress already sent)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_short_final_kept_without_progress(self, tmp_path: Path) -> None:
+        """Short final is NOT suppressed when no progress was sent."""
+        loop = _make_loop(tmp_path)
+        calls = iter([
+            LLMResponse(content="OK", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+
+        msg = InboundMessage(channel="telegram", sender_id="user1", chat_id="chat123", content="Hi")
+        result = await loop._process_message(msg)
+
+        assert result is not None
+        assert result.content == "OK"
+
+
+class TestContentAwareSyntheticAck:
+    """Tests for the content-aware synthetic acknowledgment."""
+
+    @pytest.mark.asyncio
+    async def test_ack_contains_thought_text(self, tmp_path: Path) -> None:
+        """Synthetic ack includes the actual thought that was emitted."""
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        thought_text = "Let me look up that information for you right away"
+        calls = iter([
+            LLMResponse(content=thought_text, tool_calls=[tool_call]),
+            LLMResponse(content="Here's the result", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            pass
+
+        result = await loop._run_agent_loop([], on_progress=on_progress)
+
+        synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
+        assert len(synthetic_msgs) == 1
+        assert thought_text in synthetic_msgs[0]["content"]
+        assert "Already delivered to user:" in synthetic_msgs[0]["content"]
+
+    @pytest.mark.asyncio
+    async def test_ack_truncates_long_thought(self, tmp_path: Path) -> None:
+        """Thoughts longer than 500 chars are truncated in the ack."""
+        loop = _make_loop(tmp_path)
+        tool_call = ToolCallRequest(id="call1", name="read_file", arguments={"path": "foo.txt"})
+        long_thought = "A" * 600
+        calls = iter([
+            LLMResponse(content=long_thought, tool_calls=[tool_call]),
+            LLMResponse(content="Done", tool_calls=[]),
+        ])
+        loop.provider.chat_with_retry = AsyncMock(side_effect=lambda *a, **kw: next(calls))
+        loop.tools.get_definitions = MagicMock(return_value=[])
+        loop.tools.execute = AsyncMock(return_value="ok")
+
+        async def on_progress(content: str, *, tool_hint: bool = False) -> None:
+            pass
+
+        result = await loop._run_agent_loop([], on_progress=on_progress)
+
+        synthetic_msgs = [m for m in result.messages if m.get("_synthetic")]
+        ack_content = synthetic_msgs[0]["content"]
+        # Should contain truncated version, not full 600 chars
+        assert "A" * 500 + "..." in ack_content
+        assert "A" * 600 not in ack_content

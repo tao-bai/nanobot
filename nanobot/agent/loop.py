@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import json
 import os
 import re
@@ -45,8 +46,12 @@ class RunLoopResult:
     tools_used: list[str] = field(default_factory=list)
     messages: list[dict] = field(default_factory=list)
 
-
-_PROGRESS_ACK = "[Your last message was shown to the user as a progress update. Don't repeat or paraphrase it. Only reply if you have new information to add.]"
+    @property
+    def emitted_fallback_content(self) -> str | None:
+        """Return fallback_content if it was emitted as progress, else None."""
+        if self.fallback_content and self.fallback_content.strip() in self.emitted_thoughts:
+            return self.fallback_content
+        return None
 
 
 class AgentLoop:
@@ -206,6 +211,21 @@ class AgentLoop:
 
         return ", ".join(_fmt(tc) for tc in tool_calls)
 
+    @staticmethod
+    def _is_semantic_duplicate(
+        candidate: str, emitted: set[str], threshold: float = 0.7,
+    ) -> bool:
+        """Check if candidate overlaps substantially with any emitted thought."""
+        stripped = candidate.strip()
+        if not stripped or len(stripped) < 20:
+            return stripped in emitted  # short strings: exact match only
+        for thought in emitted:
+            if stripped == thought:
+                return True
+            if difflib.SequenceMatcher(None, stripped, thought).ratio() >= threshold:
+                return True
+        return False
+
     async def _run_agent_loop(
         self,
         initial_messages: list[dict],
@@ -261,12 +281,21 @@ class AgentLoop:
                         messages, tool_call.id, tool_call.name, result
                     )
 
-                # Inject synthetic user ack so the LLM sees its thought was
-                # delivered and doesn't repeat it in the final response.
+                # Inject synthetic user ack with the actual emitted text so the LLM
+                # knows exactly what was delivered and can avoid repeating it.
                 if on_progress and thought:
+                    quoted = thought[:500] + "..." if len(thought) > 500 else thought
+                    ack = (
+                        "The text portion of your last response was already delivered "
+                        "to the user as a separate message. Your next response will be "
+                        "sent as an ADDITIONAL message. Only include NEW information "
+                        "from the tool results that was not in your previous message. "
+                        "If you have nothing new to add, respond with just 'OK'.\n\n"
+                        f'Already delivered to user:\n"""\n{quoted}\n"""'
+                    )
                     messages.append({
                         "role": "user",
-                        "content": _PROGRESS_ACK,
+                        "content": ack,
                         "_synthetic": True,
                     })
             else:
@@ -555,18 +584,27 @@ class AgentLoop:
 
         final_content = result.final_content
 
-        # Suppress duplicate: user already saw this text as a progress message
-        if final_content is not None and final_content.strip() in result.emitted_thoughts:
-            logger.debug("Suppressed duplicate final (matched emitted progress)")
+        # Suppress duplicate: user already saw substantially the same text as progress
+        if final_content is not None and self._is_semantic_duplicate(
+            final_content, result.emitted_thoughts
+        ):
+            logger.debug("Suppressed duplicate final (semantic match with emitted progress)")
             final_content = None
 
-        # Use fallback only if: final is empty AND fallback wasn't already sent as progress
+        # Use fallback only if not a semantic duplicate of emitted progress
         if (
             final_content is None
             and result.fallback_content
-            and result.fallback_content.strip() not in result.emitted_thoughts
+            and not self._is_semantic_duplicate(
+                result.fallback_content, result.emitted_thoughts
+            )
         ):
             final_content = result.fallback_content
+
+        # Suppress low-value finals when progress was already sent
+        if final_content and result.emitted_thoughts and len(final_content.strip()) <= 10:
+            logger.debug("Suppressed low-value final: {}", final_content.strip())
+            final_content = None
 
         self._save_turn(session, result.messages, 1 + len(history))
         self.sessions.save(session)
