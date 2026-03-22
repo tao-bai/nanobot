@@ -317,13 +317,18 @@ class MemoryConsolidator:
         lock = self.get_lock(session.key)
         async with lock:
             target = self.context_window_tokens // 2
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            actual = getattr(session, "last_actual_total_tokens", None)
+            if actual and actual > 0:
+                estimated, source = actual, "actual_usage"
+            else:
+                estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
             if estimated < self.context_window_tokens:
-                logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}",
+                logger.info(
+                    "Token consolidation idle {}: actual_total={}, {}/{} via {}",
                     session.key,
+                    actual,
                     estimated,
                     self.context_window_tokens,
                     source,
