@@ -58,6 +58,24 @@ def _normalize_save_memory_args(args: Any) -> dict[str, Any] | None:
         return args[0] if args and isinstance(args[0], dict) else None
     return args if isinstance(args, dict) else None
 
+
+# Some models (especially Gemini) hallucinate field names despite the schema.
+_SAVE_MEMORY_FIELD_ALIASES: dict[str, str] = {
+    # camelCase variants
+    "historyEntry": "history_entry",
+    "memoryUpdate": "memory_update",
+    # shortened names
+    "history": "history_entry",
+    "memory": "memory_update",
+    # hallucinated names
+    "description": "history_entry",
+    "summary": "history_entry",
+    "entry": "history_entry",
+    "update": "memory_update",
+    "longTermMemory": "memory_update",
+    "long_term_memory": "memory_update",
+}
+
 _TOOL_CHOICE_ERROR_MARKERS = (
     "tool_choice",
     "toolchoice",
@@ -122,7 +140,9 @@ class MemoryStore:
             return True
 
         current_memory = self.read_long_term()
-        prompt = f"""Process this conversation and call the save_memory tool with your consolidation.
+        prompt = f"""Process this conversation and call the save_memory tool with exactly these two arguments:
+- history_entry: A paragraph summarizing key events/decisions/topics. Start with [YYYY-MM-DD HH:MM].
+- memory_update: Full updated long-term memory as markdown. Include all existing facts plus new ones. Return unchanged if nothing new.
 
 ## Current Long-term Memory
 {current_memory or "(empty)"}
@@ -131,7 +151,7 @@ class MemoryStore:
 {self._format_messages(messages)}"""
 
         chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. Call the save_memory tool with your consolidation of the conversation."},
+            {"role": "system", "content": "You are a memory consolidation agent. You MUST call the save_memory tool with EXACTLY two arguments: history_entry and memory_update. Do not use any other field names."},
             {"role": "user", "content": prompt},
         ]
 
@@ -170,8 +190,15 @@ class MemoryStore:
                 logger.warning("Memory consolidation: unexpected save_memory arguments")
                 return self._fail_or_raw_archive(messages)
 
+            # Remap hallucinated/aliased field names to canonical ones
+            args = {_SAVE_MEMORY_FIELD_ALIASES.get(k, k): v for k, v in args.items()}
+
             if "history_entry" not in args or "memory_update" not in args:
-                logger.warning("Memory consolidation: save_memory payload missing required fields")
+                logger.warning(
+                    "Memory consolidation: save_memory payload missing required fields, got keys: {}, args_preview: {}",
+                    list(args.keys()),
+                    {k: str(v)[:100] for k, v in args.items()},
+                )
                 return self._fail_or_raw_archive(messages)
 
             entry = args["history_entry"]

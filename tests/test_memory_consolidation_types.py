@@ -476,3 +476,56 @@ class TestMemoryConsolidationTypeHandling:
         provider.chat_with_retry = AsyncMock(return_value=no_tool)
         assert await store.consolidate(messages, provider, "m") is False
         assert store._consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_aliased_field_names_are_remapped(self, tmp_path: Path) -> None:
+        """Gemini often returns 'description' instead of 'history_entry' — alias map should handle it."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="save_memory",
+                        arguments={
+                            "description": "[2026-03-22 14:00] User asked about weather.",
+                            "memoryUpdate": "# Memory\nUser interested in weather.",
+                        },
+                    )
+                ],
+            )
+        )
+        messages = _make_messages(message_count=10)
+
+        result = await store.consolidate(messages, provider, "test-model")
+
+        assert result is True
+        assert store.history_file.exists()
+        assert "User asked about weather" in store.history_file.read_text()
+        assert "User interested in weather" in store.memory_file.read_text()
+
+    @pytest.mark.asyncio
+    async def test_single_aliased_field_still_fails(self, tmp_path: Path) -> None:
+        """If only one field is present (even after aliasing), consolidation should fail."""
+        store = MemoryStore(tmp_path)
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(
+                content=None,
+                tool_calls=[
+                    ToolCallRequest(
+                        id="call_1",
+                        name="save_memory",
+                        arguments={"description": "Some summary without memory_update."},
+                    )
+                ],
+            )
+        )
+        messages = _make_messages(message_count=10)
+
+        result = await store.consolidate(messages, provider, "test-model")
+
+        assert result is False
+        assert not store.history_file.exists()
