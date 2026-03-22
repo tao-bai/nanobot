@@ -90,7 +90,7 @@ class ShortTermMemory:
 
         delta_days = (today_local - entry_date).days
 
-        if delta_days == 0:
+        if delta_days <= 0:
             return "today"
         if delta_days == 1:
             return "yesterday"
@@ -371,6 +371,7 @@ class ShortTermMemory:
         async with self._lock:
             now = datetime.now(timezone.utc)
             entries = self._read_entries()
+            count_before = len(entries)
 
             # Step 1: drop expired
             entries = [
@@ -378,7 +379,7 @@ class ShortTermMemory:
                 for ts, text in entries
                 if self._get_tier(ts, now) != "expired"
             ]
-            count_after_drop = len(entries)
+            dropped_expired = count_before - len(entries)
 
             # Step 2: LLM compression of large tiers
             entries = await self._compress_tiers(entries, now, provider, model)
@@ -395,7 +396,7 @@ class ShortTermMemory:
             self._write(rendered)
             logger.info(
                 "ShortTermMemory: compress complete — dropped_expired={}, remaining={}, tokens=~{}",
-                count_after_drop - len(entries) + (count_after_drop - count_after_drop),
+                dropped_expired,
                 len(entries),
                 self._estimate_tokens(rendered),
             )
