@@ -6,8 +6,12 @@ import asyncio
 import re
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
+
+if TYPE_CHECKING:
+    from nanobot.providers.base import LLMProvider
 
 _TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\]\s*")
 _UTC_COMMENT_RE = re.compile(r"^<!--\s*([\dT:.Z+-]+)\s*-->$")
@@ -282,3 +286,116 @@ class ShortTermMemory:
         rendered = self._render(existing)
         self._write(rendered)
         logger.debug("ShortTermMemory: appended entry (total={})", len(existing))
+
+    # ------------------------------------------------------------------
+    # Compression
+    # ------------------------------------------------------------------
+
+    async def _compress_tiers(
+        self,
+        entries: list[tuple[datetime, str]],
+        now: datetime,
+        provider: LLMProvider,
+        model: str,
+    ) -> list[tuple[datetime, str]]:
+        """Compress older tiers using the LLM when they exceed 3 entries.
+
+        - today / yesterday: kept as-is
+        - this_week / older: if >3 entries, call LLM to produce a single paragraph
+        """
+        # Group by tier, preserving order within each tier
+        tier_order = ("today", "yesterday", "this_week", "older")
+        buckets: dict[str, list[tuple[datetime, str]]] = {t: [] for t in tier_order}
+        for ts, text in entries:
+            tier = self._get_tier(ts, now)
+            if tier in buckets:
+                buckets[tier].append((ts, text))
+            # expired entries are already dropped before this call
+
+        result: list[tuple[datetime, str]] = []
+
+        for tier in tier_order:
+            tier_entries = buckets[tier]
+            if not tier_entries:
+                continue
+
+            if tier in ("today", "yesterday") or len(tier_entries) <= 3:
+                result.extend(tier_entries)
+                continue
+
+            # More than 3 entries in this_week or older — ask the LLM to compress
+            bullet_list = "\n".join(f"- {text}" for _, text in tier_entries)
+            system_msg = {
+                "role": "system",
+                "content": (
+                    "Compress entries into concise paragraph. "
+                    "Preserve key decisions, open tasks, outcomes. Be brief."
+                ),
+            }
+            user_msg = {"role": "user", "content": bullet_list}
+
+            try:
+                response = await provider.chat_with_retry(
+                    messages=[system_msg, user_msg],
+                    model=model,
+                )
+                compressed_text = (response.content or "").strip()
+                if not compressed_text:
+                    raise ValueError("LLM returned empty compression")
+                # Use the timestamp of the most recent entry in the tier
+                latest_ts = max(ts for ts, _ in tier_entries)
+                result.append((latest_ts, compressed_text))
+                logger.debug(
+                    "ShortTermMemory: compressed {} '{}' entries into 1",
+                    len(tier_entries),
+                    tier,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "ShortTermMemory: LLM compression failed for tier '{}', keeping as-is: {}",
+                    tier,
+                    exc,
+                )
+                result.extend(tier_entries)
+
+        return result
+
+    async def compress(self, provider: LLMProvider, model: str) -> None:
+        """Daily compression sweep.
+
+        1. Drop expired entries.
+        2. LLM-compress large older tiers.
+        3. Enforce token budget by removing oldest entries.
+        4. Write result.
+        """
+        async with self._lock:
+            now = datetime.now(timezone.utc)
+            entries = self._read_entries()
+
+            # Step 1: drop expired
+            entries = [
+                (ts, text)
+                for ts, text in entries
+                if self._get_tier(ts, now) != "expired"
+            ]
+            count_after_drop = len(entries)
+
+            # Step 2: LLM compression of large tiers
+            entries = await self._compress_tiers(entries, now, provider, model)
+
+            # Step 3: render and enforce token budget
+            rendered = self._render(entries, now=now)
+            while self._estimate_tokens(rendered) > self.token_budget and entries:
+                # Remove the oldest entry (smallest timestamp)
+                oldest_idx = min(range(len(entries)), key=lambda i: entries[i][0])
+                entries.pop(oldest_idx)
+                rendered = self._render(entries, now=now)
+
+            # Step 4: write
+            self._write(rendered)
+            logger.info(
+                "ShortTermMemory: compress complete — dropped_expired={}, remaining={}, tokens=~{}",
+                count_after_drop - len(entries) + (count_after_drop - count_after_drop),
+                len(entries),
+                self._estimate_tokens(rendered),
+            )

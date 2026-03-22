@@ -3,10 +3,12 @@
 import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import AsyncMock
 
 import pytest
 
 from nanobot.agent.memory_short_term import ShortTermMemory
+from nanobot.providers.base import LLMResponse
 
 
 class TestEntryParsing:
@@ -132,3 +134,86 @@ class TestAppendAndRender:
         assert stm.file.exists()
         entries_before = stm._read_entries()
         assert len(entries_before) == 1
+
+
+class TestCompress:
+    """Test daily compression sweep."""
+
+    @pytest.mark.asyncio
+    async def test_compress_drops_expired_entries(self, tmp_path: Path) -> None:
+        stm = ShortTermMemory(tmp_path, retention_days=7)
+        now = datetime.now(timezone.utc)
+        old_ts = now - timedelta(days=14)
+        stm._write(stm._render([(old_ts, "Old expired entry.")], now=now))
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Compressed."))
+
+        await stm.compress(provider, "test-model")
+
+        content = stm.read()
+        assert "Old expired entry" not in content
+
+    @pytest.mark.asyncio
+    async def test_compress_within_budget_no_llm_call(self, tmp_path: Path) -> None:
+        stm = ShortTermMemory(tmp_path, token_budget=5000)
+        stm.on_new_entry("[2026-03-22 14:30] Short entry.")
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock()
+
+        await stm.compress(provider, "test-model")
+
+        provider.chat_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_compress_over_budget_trims_oldest(self, tmp_path: Path) -> None:
+        stm = ShortTermMemory(tmp_path, token_budget=50)  # very small budget
+        now = datetime.now(timezone.utc)
+        entries = []
+        for i in range(20):
+            ts = now - timedelta(days=i % 6, hours=i)
+            entries.append((ts, f"Entry number {i} with some content to fill tokens."))
+        stm._write(stm._render(entries, now=now))
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(return_value=LLMResponse(content="Compressed."))
+
+        await stm.compress(provider, "test-model")
+
+        content = stm.read()
+        assert stm._estimate_tokens(content) <= 50 or content == ""
+
+    @pytest.mark.asyncio
+    async def test_compress_rebuckets_tiers_as_time_passes(self, tmp_path: Path) -> None:
+        """Entries that were 'today' should move to 'yesterday' after a day passes."""
+        stm = ShortTermMemory(tmp_path, retention_days=7)
+        now = datetime.now(timezone.utc)
+        stm._write(stm._render([(now, "Today's entry.")], now=now))
+        content_before = stm.read()
+        assert "## Today" in content_before
+
+        # Re-render with now = tomorrow
+        tomorrow = now + timedelta(days=1)
+        entries = stm._read_entries()
+        rendered = stm._render(entries, now=tomorrow)
+        assert "## Yesterday" in rendered
+
+    @pytest.mark.asyncio
+    async def test_compress_triggers_llm_for_many_entries_in_tier(self, tmp_path: Path) -> None:
+        """>3 entries in this_week tier should trigger LLM compression."""
+        stm = ShortTermMemory(tmp_path, token_budget=5000)
+        now = datetime.now(timezone.utc)
+        entries = []
+        for i in range(5):
+            ts = now - timedelta(days=3, hours=i)
+            entries.append((ts, f"This-week entry {i} about project work."))
+        stm._write(stm._render(entries, now=now))
+
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(content="Compressed week summary.")
+        )
+
+        await stm.compress(provider, "test-model")
+
+        provider.chat_with_retry.assert_called_once()
+        content = stm.read()
+        assert "Compressed week summary" in content
