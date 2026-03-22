@@ -10,14 +10,14 @@ from typing import TYPE_CHECKING
 
 from loguru import logger
 
+from nanobot.utils.helpers import ensure_dir
+
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
 
 _TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\]\s*")
 _UTC_COMMENT_RE = re.compile(r"^<!--\s*([\dT:.Z+-]+)\s*-->$")
 _RAW_MARKER = "[RAW]"
-
-# Used to strip `[HH:MM]` prefixes when moving entries to older tiers
 _TIME_PREFIX_RE = re.compile(r"^\[\d{2}:\d{2}\]\s*")
 
 
@@ -38,15 +38,11 @@ class ShortTermMemory:
         token_budget: int = 3000,
         retention_days: int = 7,
     ) -> None:
-        self.memory_dir = workspace / "memory"
+        self.memory_dir = ensure_dir(workspace / "memory")
         self.file = self.memory_dir / "SHORT_TERM.md"
         self.token_budget = token_budget
         self.retention_days = retention_days
         self._lock = asyncio.Lock()
-
-    # ------------------------------------------------------------------
-    # Primitive helpers
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _is_raw_entry(entry: str) -> bool:
@@ -116,8 +112,7 @@ class ShortTermMemory:
         return self.file.read_text(encoding="utf-8").strip()
 
     def _write(self, content: str) -> None:
-        """Write *content* to SHORT_TERM.md, creating the memory dir if needed."""
-        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        """Write *content* to SHORT_TERM.md."""
         self.file.write_text(content, encoding="utf-8")
 
     # ------------------------------------------------------------------
@@ -180,6 +175,25 @@ class ShortTermMemory:
     # Rendering
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _render_date_range_section(
+        label: str,
+        entries: list[tuple[datetime, str]],
+    ) -> str:
+        """Render a tier section with a date-range header (This Week, Older, Yesterday)."""
+        dates = [ts.astimezone().date() for ts, _ in entries]
+        oldest_date, newest_date = min(dates), max(dates)
+        if oldest_date == newest_date:
+            header = f"## {label} ({oldest_date})"
+        else:
+            header = f"## {label} ({oldest_date} – {newest_date})"
+        lines = [header]
+        for ts, text in entries:
+            clean = _TIME_PREFIX_RE.sub("", text)
+            lines.append(f"<!-- {ts.isoformat()} -->")
+            lines.append(f"- {clean}")
+        return "\n".join(lines)
+
     def _render(
         self,
         entries: list[tuple[datetime, str]],
@@ -189,7 +203,6 @@ class ShortTermMemory:
         if now is None:
             now = datetime.now(timezone.utc)
 
-        # Bucket entries, dropping expired ones
         buckets: dict[str, list[tuple[datetime, str]]] = {
             "today": [],
             "yesterday": [],
@@ -198,67 +211,28 @@ class ShortTermMemory:
         }
         for ts, text in entries:
             tier = self._get_tier(ts, now)
-            if tier == "expired":
-                continue
-            buckets[tier].append((ts, text))
+            if tier != "expired":
+                buckets[tier].append((ts, text))
 
         sections: list[str] = []
 
-        # -- Today --
         if buckets["today"]:
             lines = ["## Today"]
             for ts, text in buckets["today"]:
                 local_ts = ts.astimezone()
                 time_str = local_ts.strftime("%H:%M")
-                utc_iso = ts.isoformat()
-                lines.append(f"<!-- {utc_iso} -->")
+                lines.append(f"<!-- {ts.isoformat()} -->")
                 lines.append(f"- [{time_str}] {text}")
             sections.append("\n".join(lines))
 
-        # -- Yesterday --
         if buckets["yesterday"]:
-            lines = ["## Yesterday"]
-            for ts, text in buckets["yesterday"]:
-                clean = _TIME_PREFIX_RE.sub("", text)
-                utc_iso = ts.isoformat()
-                lines.append(f"<!-- {utc_iso} -->")
-                lines.append(f"- {clean}")
-            sections.append("\n".join(lines))
+            sections.append(self._render_date_range_section("Yesterday", buckets["yesterday"]))
 
-        # -- This Week --
         if buckets["this_week"]:
-            # Determine date range for header
-            dates = [ts.astimezone().date() for ts, _ in buckets["this_week"]]
-            oldest_date = min(dates)
-            newest_date = max(dates)
-            if oldest_date == newest_date:
-                header = f"## This Week ({oldest_date})"
-            else:
-                header = f"## This Week ({oldest_date} – {newest_date})"
-            lines = [header]
-            for ts, text in buckets["this_week"]:
-                clean = _TIME_PREFIX_RE.sub("", text)
-                utc_iso = ts.isoformat()
-                lines.append(f"<!-- {utc_iso} -->")
-                lines.append(f"- {clean}")
-            sections.append("\n".join(lines))
+            sections.append(self._render_date_range_section("This Week", buckets["this_week"]))
 
-        # -- Older --
         if buckets["older"]:
-            dates = [ts.astimezone().date() for ts, _ in buckets["older"]]
-            oldest_date = min(dates)
-            newest_date = max(dates)
-            if oldest_date == newest_date:
-                header = f"## Older ({oldest_date})"
-            else:
-                header = f"## Older ({oldest_date} – {newest_date})"
-            lines = [header]
-            for ts, text in buckets["older"]:
-                clean = _TIME_PREFIX_RE.sub("", text)
-                utc_iso = ts.isoformat()
-                lines.append(f"<!-- {utc_iso} -->")
-                lines.append(f"- {clean}")
-            sections.append("\n".join(lines))
+            sections.append(self._render_date_range_section("Older", buckets["older"]))
 
         return "\n\n".join(sections) + "\n" if sections else ""
 
@@ -384,12 +358,11 @@ class ShortTermMemory:
             # Step 2: LLM compression of large tiers
             entries = await self._compress_tiers(entries, now, provider, model)
 
-            # Step 3: render and enforce token budget
+            # Step 3: enforce token budget — sort by timestamp so we can pop oldest cheaply
+            entries.sort(key=lambda e: e[0])
             rendered = self._render(entries, now=now)
             while self._estimate_tokens(rendered) > self.token_budget and entries:
-                # Remove the oldest entry (smallest timestamp)
-                oldest_idx = min(range(len(entries)), key=lambda i: entries[i][0])
-                entries.pop(oldest_idx)
+                entries.pop(0)
                 rendered = self._render(entries, now=now)
 
             # Step 4: write

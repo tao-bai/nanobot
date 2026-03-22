@@ -101,6 +101,10 @@ class MemoryStore:
             except Exception:
                 logger.warning("Short-term memory callback failed", exc_info=True)
 
+    def on_history_append(self, callback: Callable[[str], None]) -> None:
+        """Register a callback to be invoked after each history entry is appended."""
+        self._on_history_append.append(callback)
+
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
         return f"## Long-term Memory\n{long_term}" if long_term else ""

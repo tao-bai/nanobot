@@ -113,7 +113,7 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
 
     def _read_short_term(self) -> str:
         """Read SHORT_TERM.md if it exists."""
-        path = self.workspace / "memory" / "SHORT_TERM.md"
+        path = self.memory.memory_dir / "SHORT_TERM.md"
         if path.exists():
             return path.read_text(encoding="utf-8").strip()
         return ""

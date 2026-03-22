@@ -119,7 +119,7 @@ class AgentLoop:
             token_budget=short_term_token_budget,
             retention_days=short_term_retention_days,
         )
-        self.memory_consolidator.store._on_history_append.append(self._short_term.on_new_entry)
+        self.memory_consolidator.store.on_history_append(self._short_term.on_new_entry)
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:

@@ -479,10 +479,10 @@ class TestMemoryConsolidationTypeHandling:
 
     @pytest.mark.asyncio
     async def test_history_append_fires_callbacks(self, tmp_path: Path) -> None:
-        """Callback registered on _on_history_append should fire after append."""
+        """Callback registered via on_history_append should fire after append."""
         store = MemoryStore(tmp_path)
         received: list[str] = []
-        store._on_history_append.append(lambda entry: received.append(entry))
+        store.on_history_append(lambda entry: received.append(entry))
 
         store.append_history("[2026-03-22 14:00] Test entry.")
 
@@ -497,7 +497,7 @@ class TestMemoryConsolidationTypeHandling:
         def bad_callback(entry: str) -> None:
             raise RuntimeError("boom")
 
-        store._on_history_append.append(bad_callback)
+        store.on_history_append(bad_callback)
 
         store.append_history("[2026-03-22 14:00] Test entry.")
 

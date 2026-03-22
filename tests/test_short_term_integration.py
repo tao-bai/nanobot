@@ -31,7 +31,7 @@ class TestShortTermIntegration:
         """Full flow: consolidation writes history → callback fires → SHORT_TERM.md exists."""
         store = MemoryStore(tmp_path)
         stm = ShortTermMemory(tmp_path)
-        store._on_history_append.append(stm.on_new_entry)
+        store.on_history_append(stm.on_new_entry)
 
         provider = AsyncMock()
         provider.chat_with_retry = AsyncMock(
