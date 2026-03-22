@@ -82,6 +82,7 @@ class MemoryStore:
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
         self._consecutive_failures = 0
+        self._on_history_append: list[Callable[[str], None]] = []
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -94,6 +95,11 @@ class MemoryStore:
     def append_history(self, entry: str) -> None:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
+        for cb in self._on_history_append:
+            try:
+                cb(entry)
+            except Exception:
+                logger.warning("Short-term memory callback failed", exc_info=True)
 
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
