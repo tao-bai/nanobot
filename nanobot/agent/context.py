@@ -33,8 +33,14 @@ class ContextBuilder:
             parts.append(bootstrap)
 
         memory = self.memory.get_memory_context()
-        if memory:
-            parts.append(f"# Memory\n\n{memory}")
+        short_term = self._read_short_term()
+        if memory or short_term:
+            memory_parts = []
+            if memory:
+                memory_parts.append(memory)
+            if short_term:
+                memory_parts.append(f"## Recent Activity\n{short_term}")
+            parts.append("# Memory\n\n" + "\n\n".join(memory_parts))
 
         always_skills = self.skills.get_always_skills()
         if always_skills:
@@ -104,6 +110,13 @@ Reply directly with text for conversations. Only use the 'message' tool to send 
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
+
+    def _read_short_term(self) -> str:
+        """Read SHORT_TERM.md if it exists."""
+        path = self.workspace / "memory" / "SHORT_TERM.md"
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+        return ""
 
     def _load_bootstrap_files(self) -> str:
         """Load all bootstrap files from workspace."""
