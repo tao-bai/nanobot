@@ -188,3 +188,102 @@ async def test_preflight_consolidation_before_llm_call(tmp_path, monkeypatch) ->
     assert "consolidate" in order
     assert "llm" in order
     assert order.index("consolidate") < order.index("llm")
+
+
+@pytest.mark.asyncio
+async def test_actual_total_tokens_triggers_consolidation(tmp_path, monkeypatch) -> None:
+    """When session has actual_total_tokens above threshold, use it instead of estimation."""
+    loop = _make_loop(tmp_path, estimated_tokens=50, context_window_tokens=200)
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.messages = [
+        {"role": "user", "content": "u1", "timestamp": "2026-01-01T00:00:00"},
+        {"role": "assistant", "content": "a1", "timestamp": "2026-01-01T00:00:01"},
+        {"role": "user", "content": "u2", "timestamp": "2026-01-01T00:00:02"},
+    ]
+    loop.sessions.save(session)
+    # Set actual tokens above context_window — should trigger consolidation
+    # even though estimated_tokens=50 is below threshold
+    session.last_actual_total_tokens = 500
+    monkeypatch.setattr(memory_module, "estimate_message_tokens", lambda _m: 200)
+
+    await loop.memory_consolidator.maybe_consolidate_by_tokens(session)
+
+    assert loop.memory_consolidator.consolidate_messages.await_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_actual_total_tokens_none_falls_back_to_estimation(tmp_path) -> None:
+    """When actual tokens is None, fall back to estimation (existing behavior)."""
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.last_actual_total_tokens = None  # explicit None
+
+    await loop.process_direct("hello", session_key="cli:test")
+
+    # estimated=100 < context_window=200, so no consolidation
+    loop.memory_consolidator.consolidate_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_actual_total_tokens_zero_falls_back_to_estimation(tmp_path) -> None:
+    """When actual tokens is 0 (empty usage dict), fall back to estimation."""
+    loop = _make_loop(tmp_path, estimated_tokens=100, context_window_tokens=200)
+    loop.memory_consolidator.consolidate_messages = AsyncMock(return_value=True)  # type: ignore[method-assign]
+
+    session = loop.sessions.get_or_create("cli:test")
+    session.last_actual_total_tokens = 0
+
+    await loop.process_direct("hello", session_key="cli:test")
+
+    # estimated=100 < context_window=200, so no consolidation
+    loop.memory_consolidator.consolidate_messages.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_run_agent_loop_returns_last_usage(tmp_path) -> None:
+    """_run_agent_loop should return the last response's usage dict."""
+    loop = _make_loop(tmp_path, estimated_tokens=50, context_window_tokens=200)
+    usage = {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150}
+    loop.provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="ok", tool_calls=[], usage=usage)
+    )
+
+    _, _, _, last_usage = await loop._run_agent_loop(
+        [{"role": "user", "content": "test"}]
+    )
+
+    assert last_usage == usage
+
+
+@pytest.mark.asyncio
+async def test_run_agent_loop_returns_empty_usage_when_not_populated(tmp_path) -> None:
+    """_run_agent_loop returns empty dict when provider doesn't populate usage."""
+    loop = _make_loop(tmp_path, estimated_tokens=50, context_window_tokens=200)
+    loop.provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="ok", tool_calls=[])
+    )
+
+    _, _, _, last_usage = await loop._run_agent_loop(
+        [{"role": "user", "content": "test"}]
+    )
+
+    assert last_usage == {}
+
+
+@pytest.mark.asyncio
+async def test_process_direct_sets_actual_total_tokens_on_session(tmp_path) -> None:
+    """process_direct should set last_actual_total_tokens on the session from provider usage."""
+    loop = _make_loop(tmp_path, estimated_tokens=50, context_window_tokens=200)
+    usage = {"prompt_tokens": 200, "completion_tokens": 80, "total_tokens": 280}
+    loop.provider.chat_with_retry = AsyncMock(
+        return_value=LLMResponse(content="ok", tool_calls=[], usage=usage)
+    )
+
+    await loop.process_direct("hello", session_key="cli:test")
+
+    session = loop.sessions.get_or_create("cli:test")
+    assert session.last_actual_total_tokens == 280

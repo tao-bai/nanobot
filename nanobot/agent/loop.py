@@ -15,6 +15,7 @@ from loguru import logger
 
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
+from nanobot.agent.memory_short_term import ShortTermMemory
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -64,6 +65,8 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        short_term_token_budget: int = 3000,
+        short_term_retention_days: int = 7,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
@@ -111,6 +114,12 @@ class AgentLoop:
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
         )
+        self._short_term = ShortTermMemory(
+            workspace,
+            token_budget=short_term_token_budget,
+            retention_days=short_term_retention_days,
+        )
+        self.memory_consolidator.store.on_history_append(self._short_term.on_new_entry)
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -184,12 +193,13 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
-    ) -> tuple[str | None, list[str], list[dict]]:
+    ) -> tuple[str | None, list[str], list[dict], dict[str, int]]:
         """Run the agent iteration loop."""
         messages = initial_messages
         iteration = 0
         final_content = None
         tools_used: list[str] = []
+        last_usage: dict[str, int] = {}
 
         while iteration < self.max_iterations:
             iteration += 1
@@ -201,6 +211,8 @@ class AgentLoop:
                 tools=tool_defs,
                 model=self.model,
             )
+            if response.usage:
+                last_usage = response.usage
 
             if response.has_tool_calls:
                 if on_progress:
@@ -251,12 +263,13 @@ class AgentLoop:
                 "without completing the task. You can try breaking the task into smaller steps."
             )
 
-        return final_content, tools_used, messages
+        return final_content, tools_used, messages, last_usage
 
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
         await self._connect_mcp()
+        self._schedule_background(self._daily_short_term_sweep())
         logger.info("Agent loop started")
 
         while self._running:
@@ -354,6 +367,15 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    async def _daily_short_term_sweep(self) -> None:
+        """Compress short-term memory once daily."""
+        while self._running:
+            await asyncio.sleep(86400)
+            try:
+                await self._short_term.compress(self.provider, self.model)
+            except Exception:
+                logger.exception("Short-term memory sweep failed")
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -383,9 +405,10 @@ class AgentLoop:
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
             )
-            final_content, _, all_msgs = await self._run_agent_loop(messages)
+            final_content, _, all_msgs, last_usage = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
             self.sessions.save(session)
+            session.last_actual_total_tokens = last_usage.get("total_tokens") or None
             self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
@@ -443,7 +466,7 @@ class AgentLoop:
                 channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
             ))
 
-        final_content, _, all_msgs = await self._run_agent_loop(
+        final_content, _, all_msgs, last_usage = await self._run_agent_loop(
             initial_messages, on_progress=on_progress or _bus_progress,
         )
 
@@ -452,6 +475,7 @@ class AgentLoop:
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
+        session.last_actual_total_tokens = last_usage.get("total_tokens") or None
         self._schedule_background(self.memory_consolidator.maybe_consolidate_by_tokens(session))
 
         if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:

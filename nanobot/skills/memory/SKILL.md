@@ -1,6 +1,6 @@
 ---
 name: memory
-description: Two-layer memory system with grep-based recall.
+description: Three-layer memory system with grep-based recall.
 always: true
 ---
 
@@ -9,6 +9,7 @@ always: true
 ## Structure
 
 - `memory/MEMORY.md` — Long-term facts (preferences, project context, relationships). Always loaded into your context.
+- `memory/SHORT_TERM.md` — Rolling recent activity (1–7 days), auto-maintained. Loaded into context automatically as "Recent Activity". Do not edit manually.
 - `memory/HISTORY.md` — Append-only event log. NOT loaded into context. Search it with grep-style tools or in-memory filters. Each entry starts with [YYYY-MM-DD HH:MM].
 
 ## Search Past Events

@@ -529,3 +529,30 @@ class TestMemoryConsolidationTypeHandling:
 
         assert result is False
         assert not store.history_file.exists()
+
+    @pytest.mark.asyncio
+    async def test_history_append_fires_callbacks(self, tmp_path: Path) -> None:
+        """Callback registered via on_history_append should fire after append."""
+        store = MemoryStore(tmp_path)
+        received: list[str] = []
+        store.on_history_append(lambda entry: received.append(entry))
+
+        store.append_history("[2026-03-22 14:00] Test entry.")
+
+        assert len(received) == 1
+        assert "Test entry" in received[0]
+
+    @pytest.mark.asyncio
+    async def test_history_append_callback_exception_does_not_break_consolidation(self, tmp_path: Path) -> None:
+        """A failing callback should not prevent history from being written."""
+        store = MemoryStore(tmp_path)
+
+        def bad_callback(entry: str) -> None:
+            raise RuntimeError("boom")
+
+        store.on_history_append(bad_callback)
+
+        store.append_history("[2026-03-22 14:00] Test entry.")
+
+        # History file should still contain the entry
+        assert "Test entry" in store.history_file.read_text()

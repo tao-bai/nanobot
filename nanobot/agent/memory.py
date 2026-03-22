@@ -100,6 +100,7 @@ class MemoryStore:
         self.memory_file = self.memory_dir / "MEMORY.md"
         self.history_file = self.memory_dir / "HISTORY.md"
         self._consecutive_failures = 0
+        self._on_history_append: list[Callable[[str], None]] = []
 
     def read_long_term(self) -> str:
         if self.memory_file.exists():
@@ -112,6 +113,15 @@ class MemoryStore:
     def append_history(self, entry: str) -> None:
         with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(entry.rstrip() + "\n\n")
+        for cb in self._on_history_append:
+            try:
+                cb(entry)
+            except Exception:
+                logger.warning("Short-term memory callback failed", exc_info=True)
+
+    def on_history_append(self, callback: Callable[[str], None]) -> None:
+        """Register a callback to be invoked after each history entry is appended."""
+        self._on_history_append.append(callback)
 
     def get_memory_context(self) -> str:
         long_term = self.read_long_term()
@@ -334,13 +344,18 @@ class MemoryConsolidator:
         lock = self.get_lock(session.key)
         async with lock:
             target = self.context_window_tokens // 2
-            estimated, source = self.estimate_session_prompt_tokens(session)
+            actual = getattr(session, "last_actual_total_tokens", None)
+            if actual and actual > 0:
+                estimated, source = actual, "actual_usage"
+            else:
+                estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
             if estimated < self.context_window_tokens:
-                logger.debug(
-                    "Token consolidation idle {}: {}/{} via {}",
+                logger.info(
+                    "Token consolidation idle {}: actual_total={}, {}/{} via {}",
                     session.key,
+                    actual,
                     estimated,
                     self.context_window_tokens,
                     source,
