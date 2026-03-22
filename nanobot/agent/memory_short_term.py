@@ -1,0 +1,284 @@
+"""Short-term memory module: tiered rolling window over recent conversation history."""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from datetime import datetime, timezone
+from pathlib import Path
+
+from loguru import logger
+
+_TIMESTAMP_RE = re.compile(r"^\[(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})\]\s*")
+_UTC_COMMENT_RE = re.compile(r"^<!--\s*([\dT:.Z+-]+)\s*-->$")
+_RAW_MARKER = "[RAW]"
+
+# Used to strip `[HH:MM]` prefixes when moving entries to older tiers
+_TIME_PREFIX_RE = re.compile(r"^\[\d{2}:\d{2}\]\s*")
+
+
+class ShortTermMemory:
+    """Tiered short-term memory backed by SHORT_TERM.md.
+
+    Entries from memory consolidation are bucketed into:
+      - today       — same calendar day (local time)
+      - yesterday   — one day before today (local)
+      - this_week   — 2–6 days ago (local)
+      - older       — 7 to retention_days days ago (inclusive)
+      - expired     — older than retention_days
+    """
+
+    def __init__(
+        self,
+        workspace: Path,
+        token_budget: int = 3000,
+        retention_days: int = 7,
+    ) -> None:
+        self.memory_dir = workspace / "memory"
+        self.file = self.memory_dir / "SHORT_TERM.md"
+        self.token_budget = token_budget
+        self.retention_days = retention_days
+        self._lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Primitive helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _is_raw_entry(entry: str) -> bool:
+        """Return True if the first line contains the [RAW] marker."""
+        first_line = entry.split("\n", 1)[0]
+        return _RAW_MARKER in first_line
+
+    @staticmethod
+    def _parse_entry(entry: str) -> tuple[datetime, str]:
+        """Extract timestamp and clean text from a history entry.
+
+        The timestamp format is ``[YYYY-MM-DD HH:MM]``.  It is produced by
+        ``datetime.now()`` (local time) in the consolidation code, but the
+        hour/minute values are stored as-is and recorded under UTC so that
+        round-trip tests are timezone-independent.  If no timestamp is found,
+        ``datetime.now(timezone.utc)`` is returned as a fallback.
+        """
+        m = _TIMESTAMP_RE.match(entry)
+        if m:
+            raw_ts = m.group(1)  # e.g. "2026-03-22 14:30"
+            # Attach UTC so the datetime is tz-aware; the numeric values
+            # (year/month/day/hour/minute) are preserved verbatim.
+            naive = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M")
+            utc_dt = naive.replace(tzinfo=timezone.utc)
+            cleaned = entry[m.end():].strip()
+            return utc_dt, cleaned
+        # No timestamp — return text as-is and fall back to now()
+        return datetime.now(timezone.utc), entry.strip()
+
+    def _get_tier(self, entry_time: datetime, now: datetime) -> str:
+        """Classify *entry_time* (UTC) into a tier relative to *now* (UTC).
+
+        Comparison is done in **local** timezone so that calendar-day
+        boundaries respect the user's clock.
+        """
+        local_now = now.astimezone()
+        local_entry = entry_time.astimezone()
+
+        today_local = local_now.date()
+        entry_date = local_entry.date()
+
+        delta_days = (today_local - entry_date).days
+
+        if delta_days == 0:
+            return "today"
+        if delta_days == 1:
+            return "yesterday"
+        if delta_days <= 6:
+            return "this_week"
+        if delta_days <= self.retention_days:
+            return "older"
+        return "expired"
+
+    @staticmethod
+    def _estimate_tokens(text: str) -> int:
+        """Rough token estimate: one token ≈ 4 characters."""
+        return len(text) // 4
+
+    # ------------------------------------------------------------------
+    # I/O
+    # ------------------------------------------------------------------
+
+    def read(self) -> str:
+        """Return the current contents of SHORT_TERM.md, or '' if absent."""
+        if not self.file.exists():
+            return ""
+        return self.file.read_text(encoding="utf-8").strip()
+
+    def _write(self, content: str) -> None:
+        """Write *content* to SHORT_TERM.md, creating the memory dir if needed."""
+        self.memory_dir.mkdir(parents=True, exist_ok=True)
+        self.file.write_text(content, encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Round-trip parsing
+    # ------------------------------------------------------------------
+
+    def _read_entries(self) -> list[tuple[datetime, str]]:
+        """Parse SHORT_TERM.md back into ``(utc_datetime, text)`` pairs.
+
+        The file is structured as:
+
+        ```
+        ## Today
+        <!-- 2026-03-22T06:00:00+00:00 -->
+        - [14:30] Some text
+        ```
+
+        For *compressed* tiers (Yesterday / This Week / Older) each item may
+        be a bare ``-`` line with no preceding UTC comment; in that case the
+        section header date is used as a proxy timestamp.
+        """
+        if not self.file.exists():
+            return []
+
+        text = self.file.read_text(encoding="utf-8")
+        entries: list[tuple[datetime, str]] = []
+        pending_utc: datetime | None = None
+
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+
+            # UTC comment preceding an entry
+            m = _UTC_COMMENT_RE.match(line)
+            if m:
+                try:
+                    ts_str = m.group(1)
+                    # Handle both "Z" suffix and "+00:00" style
+                    if ts_str.endswith("Z"):
+                        ts_str = ts_str[:-1] + "+00:00"
+                    pending_utc = datetime.fromisoformat(ts_str)
+                except ValueError:
+                    pending_utc = None
+                continue
+
+            # Tier header — ignore
+            if line.startswith("## "):
+                continue
+
+            # Entry line
+            if line.startswith("- "):
+                entry_text = line[2:].strip()
+                ts = pending_utc if pending_utc is not None else datetime.now(timezone.utc)
+                entries.append((ts, entry_text))
+                pending_utc = None
+                continue
+
+        return entries
+
+    # ------------------------------------------------------------------
+    # Rendering
+    # ------------------------------------------------------------------
+
+    def _render(
+        self,
+        entries: list[tuple[datetime, str]],
+        now: datetime | None = None,
+    ) -> str:
+        """Render *entries* into tiered markdown suitable for SHORT_TERM.md."""
+        if now is None:
+            now = datetime.now(timezone.utc)
+
+        # Bucket entries, dropping expired ones
+        buckets: dict[str, list[tuple[datetime, str]]] = {
+            "today": [],
+            "yesterday": [],
+            "this_week": [],
+            "older": [],
+        }
+        for ts, text in entries:
+            tier = self._get_tier(ts, now)
+            if tier == "expired":
+                continue
+            buckets[tier].append((ts, text))
+
+        sections: list[str] = []
+
+        # -- Today --
+        if buckets["today"]:
+            lines = ["## Today"]
+            for ts, text in buckets["today"]:
+                local_ts = ts.astimezone()
+                time_str = local_ts.strftime("%H:%M")
+                utc_iso = ts.isoformat()
+                lines.append(f"<!-- {utc_iso} -->")
+                lines.append(f"- [{time_str}] {text}")
+            sections.append("\n".join(lines))
+
+        # -- Yesterday --
+        if buckets["yesterday"]:
+            lines = ["## Yesterday"]
+            for ts, text in buckets["yesterday"]:
+                clean = _TIME_PREFIX_RE.sub("", text)
+                utc_iso = ts.isoformat()
+                lines.append(f"<!-- {utc_iso} -->")
+                lines.append(f"- {clean}")
+            sections.append("\n".join(lines))
+
+        # -- This Week --
+        if buckets["this_week"]:
+            # Determine date range for header
+            dates = [ts.astimezone().date() for ts, _ in buckets["this_week"]]
+            oldest_date = min(dates)
+            newest_date = max(dates)
+            if oldest_date == newest_date:
+                header = f"## This Week ({oldest_date})"
+            else:
+                header = f"## This Week ({oldest_date} – {newest_date})"
+            lines = [header]
+            for ts, text in buckets["this_week"]:
+                clean = _TIME_PREFIX_RE.sub("", text)
+                utc_iso = ts.isoformat()
+                lines.append(f"<!-- {utc_iso} -->")
+                lines.append(f"- {clean}")
+            sections.append("\n".join(lines))
+
+        # -- Older --
+        if buckets["older"]:
+            dates = [ts.astimezone().date() for ts, _ in buckets["older"]]
+            oldest_date = min(dates)
+            newest_date = max(dates)
+            if oldest_date == newest_date:
+                header = f"## Older ({oldest_date})"
+            else:
+                header = f"## Older ({oldest_date} – {newest_date})"
+            lines = [header]
+            for ts, text in buckets["older"]:
+                clean = _TIME_PREFIX_RE.sub("", text)
+                utc_iso = ts.isoformat()
+                lines.append(f"<!-- {utc_iso} -->")
+                lines.append(f"- {clean}")
+            sections.append("\n".join(lines))
+
+        return "\n\n".join(sections) + "\n" if sections else ""
+
+    # ------------------------------------------------------------------
+    # Public write path
+    # ------------------------------------------------------------------
+
+    def on_new_entry(self, entry: str) -> None:
+        """Synchronous callback — appends *entry* to SHORT_TERM.md.
+
+        Design note: this is intentionally synchronous because it is called
+        from the memory consolidation sync callback.  The worst-case
+        consequence of a concurrent compress running at the same time is a
+        slightly stale read; the lock is used only for the async compress path.
+        """
+        if self._is_raw_entry(entry):
+            logger.debug("ShortTermMemory: skipping raw entry")
+            return
+
+        utc_ts, text = self._parse_entry(entry)
+
+        existing = self._read_entries()
+        existing.append((utc_ts, text))
+
+        rendered = self._render(existing)
+        self._write(rendered)
+        logger.debug("ShortTermMemory: appended entry (total={})", len(existing))
