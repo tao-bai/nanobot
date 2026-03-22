@@ -39,6 +39,8 @@ class AgentDefaults(Base):
     temperature: float = 0.1
     max_tool_iterations: int = 40
     reasoning_effort: str | None = None  # low / medium / high - enables LLM thinking mode
+    short_term_token_budget: int = 3000
+    short_term_retention_days: int = 7
 
 
 class AgentsConfig(Base):
