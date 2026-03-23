@@ -268,6 +268,41 @@ class AgentLoop:
 
         return final_content, tools_used, messages, last_usage
 
+    async def _handle_subagent_result(
+        self, content: str, channel: str, chat_id: str,
+    ) -> OutboundMessage:
+        """Summarize a subagent completion — single LLM call, no tools."""
+        from datetime import datetime
+
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Summarize the following background task result for the user "
+                    "in 1-2 sentences. Be natural and concise. Do not mention "
+                    "technical details like subagents or task IDs."
+                ),
+            },
+            {"role": "user", "content": content},
+        ]
+        response = await self.provider.chat_with_retry(
+            messages=messages, tools=None, model=self.model, max_tokens=256,
+        )
+        summary = self._strip_think(response.content) or "Background task completed."
+
+        # Save summary to session history
+        key = f"{channel}:{chat_id}"
+        session = self.sessions.get_or_create(key)
+        session.messages.append({
+            "role": "assistant",
+            "content": summary,
+            "timestamp": datetime.now().isoformat(),
+        })
+        session.updated_at = datetime.now()
+        self.sessions.save(session)
+
+        return OutboundMessage(channel=channel, chat_id=chat_id, content=summary)
+
     async def run(self) -> None:
         """Run the agent loop, dispatching messages as tasks to stay responsive to /stop."""
         self._running = True
@@ -411,17 +446,20 @@ class AgentLoop:
             channel, chat_id = (msg.chat_id.split(":", 1) if ":" in msg.chat_id
                                 else ("cli", msg.chat_id))
             logger.info("Processing system message from {}", msg.sender_id)
+
+            # Subagent completions get a dedicated summarization path (no tools,
+            # no agent loop) to avoid repetitive/degenerate LLM output.
+            if msg.sender_id == "subagent":
+                return await self._handle_subagent_result(msg.content, channel, chat_id)
+
             key = f"{channel}:{chat_id}"
             session = self.sessions.get_or_create(key)
             await self.memory_consolidator.maybe_consolidate_by_tokens(session)
             self._set_tool_context(channel, chat_id, msg.metadata.get("message_id"))
             history = session.get_history(max_messages=0)
-            # Subagent results should be assistant role, other system messages use user role
-            current_role = "assistant" if msg.sender_id == "subagent" else "user"
             messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
-                current_role=current_role,
             )
             final_content, _, all_msgs, last_usage = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
