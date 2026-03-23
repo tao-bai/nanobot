@@ -46,3 +46,26 @@ class RawMessageLog:
             else:
                 filtered.append(c)
         return {**message, "content": filtered}
+
+    @staticmethod
+    def strip_runtime_context(message: dict[str, Any], tag: str) -> dict[str, Any]:
+        """Strip runtime context prefix from user messages."""
+        if message.get("role") != "user":
+            return message
+        content = message.get("content")
+        if isinstance(content, str) and content.startswith(tag):
+            parts = content.split("\n\n", 1)
+            if len(parts) > 1 and parts[1].strip():
+                return {**message, "content": parts[1]}
+            return message
+        if isinstance(content, list):
+            filtered = [
+                c for c in content
+                if not (
+                    c.get("type") == "text"
+                    and isinstance(c.get("text"), str)
+                    and c["text"].startswith(tag)
+                )
+            ]
+            return {**message, "content": filtered} if filtered else message
+        return message

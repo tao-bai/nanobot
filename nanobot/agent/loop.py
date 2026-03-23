@@ -494,7 +494,9 @@ class AgentLoop:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
         for m in messages[skip:]:
-            self.raw_log.append(session.key, RawMessageLog.strip_base64_images(m))
+            raw = RawMessageLog.strip_base64_images(m)
+            raw = RawMessageLog.strip_runtime_context(raw, ContextBuilder._RUNTIME_CONTEXT_TAG)
+            self.raw_log.append(session.key, raw)
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):

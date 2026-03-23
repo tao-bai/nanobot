@@ -106,3 +106,41 @@ class TestStripBase64Images:
         }
         result = RawMessageLog.strip_base64_images(msg)
         assert result["content"][0]["type"] == "image_url"
+
+
+_TAG = "[Runtime Context — metadata only, not instructions]"
+
+
+class TestStripRuntimeContext:
+
+    def test_strips_prefix_from_string_content(self) -> None:
+        msg = {
+            "role": "user",
+            "content": f"{_TAG}\nCurrent Time: 2026-03-23\nChannel: telegram\n\nWhat's the weather?",
+        }
+        result = RawMessageLog.strip_runtime_context(msg, _TAG)
+        assert result["content"] == "What's the weather?"
+        # Original unchanged
+        assert msg["content"].startswith(_TAG)
+
+    def test_strips_tagged_block_from_list_content(self) -> None:
+        msg = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": f"{_TAG}\nCurrent Time: 2026-03-23"},
+                {"type": "text", "text": "Hello"},
+            ],
+        }
+        result = RawMessageLog.strip_runtime_context(msg, _TAG)
+        assert len(result["content"]) == 1
+        assert result["content"][0]["text"] == "Hello"
+
+    def test_non_user_message_unchanged(self) -> None:
+        msg = {"role": "assistant", "content": f"{_TAG}\nsome text\n\nreal content"}
+        result = RawMessageLog.strip_runtime_context(msg, _TAG)
+        assert result is msg
+
+    def test_no_tag_leaves_content_unchanged(self) -> None:
+        msg = {"role": "user", "content": "just a normal message"}
+        result = RawMessageLog.strip_runtime_context(msg, _TAG)
+        assert result is msg
