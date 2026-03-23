@@ -177,14 +177,11 @@ class SubagentManager:
         """Announce the subagent result to the main agent via the message bus."""
         status_text = "completed successfully" if status == "ok" else "failed"
 
-        announce_content = f"""[Subagent '{label}' {status_text}]
-
-Task: {task}
-
-Result:
-{result}
-
-Summarize this naturally for the user. Keep it brief (1-2 sentences). Do not mention technical details like "subagent" or task IDs."""
+        announce_content = (
+            f"Task: {task}\n"
+            f"Status: {status_text}\n\n"
+            f"Result:\n{result}"
+        )
 
         # Inject as system message to trigger main agent
         msg = InboundMessage(
