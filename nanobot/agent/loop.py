@@ -16,6 +16,7 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.memory import MemoryConsolidator
 from nanobot.agent.memory_short_term import ShortTermMemory
+from nanobot.agent.raw_log import RawMessageLog
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.skills import BUILTIN_SKILLS_DIR
@@ -120,6 +121,7 @@ class AgentLoop:
             retention_days=short_term_retention_days,
         )
         self.memory_consolidator.store.on_history_append(self._short_term.on_new_entry)
+        self.raw_log = RawMessageLog(self.memory_consolidator.store.memory_dir)
         self._register_default_tools()
 
     def _register_default_tools(self) -> None:
@@ -492,6 +494,7 @@ class AgentLoop:
         """Save new-turn messages into session, truncating large tool results."""
         from datetime import datetime
         for m in messages[skip:]:
+            self.raw_log.append(session.key, RawMessageLog.strip_base64_images(m))
             entry = dict(m)
             role, content = entry.get("role"), entry.get("content")
             if role == "assistant" and not content and not entry.get("tool_calls"):
