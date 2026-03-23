@@ -8,6 +8,7 @@ import os
 import re
 import sys
 from contextlib import AsyncExitStack
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
@@ -370,9 +371,24 @@ class AgentLoop:
         task.add_done_callback(self._background_tasks.remove)
 
     async def _daily_short_term_sweep(self) -> None:
-        """Compress short-term memory once daily."""
+        """Backfill + compress on startup, then compress daily at 4 AM local."""
+        # Startup: backfill from raw logs if SHORT_TERM.md doesn't exist, then compress
+        try:
+            raw_dir = self.memory_consolidator.store.memory_dir / "raw"
+            await self._short_term.backfill(raw_dir, self.provider, self.model)
+            await self._short_term.compress(self.provider, self.model)
+        except Exception:
+            logger.exception("Short-term memory startup sweep failed")
+
+        # Daily at 4 AM local
         while self._running:
-            await asyncio.sleep(86400)
+            now = datetime.now()
+            target = now.replace(hour=4, minute=0, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            delay = (target - now).total_seconds()
+            logger.info("Short-term memory: next sweep at {}", target.strftime("%Y-%m-%d %H:%M"))
+            await asyncio.sleep(delay)
             try:
                 await self._short_term.compress(self.provider, self.model)
             except Exception:

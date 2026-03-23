@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -55,25 +56,23 @@ class ShortTermMemory:
         """Extract timestamp and clean text from a history entry.
 
         The timestamp format is ``[YYYY-MM-DD HH:MM]``.  It is produced by
-        ``datetime.now()`` (local time) in the consolidation code, but the
-        hour/minute values are stored as-is and recorded under UTC so that
-        round-trip tests are timezone-independent.  If no timestamp is found,
-        ``datetime.now(timezone.utc)`` is returned as a fallback.
+        ``datetime.now()`` (local time) in the consolidation code, so the
+        numeric values represent **local** time.  We attach the system's
+        local timezone so downstream code can display them without a second
+        UTC→local conversion.
         """
         m = _TIMESTAMP_RE.match(entry)
         if m:
             raw_ts = m.group(1)  # e.g. "2026-03-22 14:30"
-            # Attach UTC so the datetime is tz-aware; the numeric values
-            # (year/month/day/hour/minute) are preserved verbatim.
             naive = datetime.strptime(raw_ts, "%Y-%m-%d %H:%M")
-            utc_dt = naive.replace(tzinfo=timezone.utc)
+            local_dt = naive.replace(tzinfo=datetime.now().astimezone().tzinfo)
             cleaned = entry[m.end():].strip()
-            return utc_dt, cleaned
+            return local_dt, cleaned
         # No timestamp — return text as-is and fall back to now()
-        return datetime.now(timezone.utc), entry.strip()
+        return datetime.now().astimezone(), entry.strip()
 
     def _get_tier(self, entry_time: datetime, now: datetime) -> str:
-        """Classify *entry_time* (UTC) into a tier relative to *now* (UTC).
+        """Classify *entry_time* into a tier relative to *now*.
 
         Comparison is done in **local** timezone so that calendar-day
         boundaries respect the user's clock.
@@ -164,7 +163,7 @@ class ShortTermMemory:
             # Entry line
             if line.startswith("- "):
                 entry_text = line[2:].strip()
-                ts = pending_utc if pending_utc is not None else datetime.now(timezone.utc)
+                ts = pending_utc if pending_utc is not None else datetime.now().astimezone()
                 entries.append((ts, entry_text))
                 pending_utc = None
                 continue
@@ -221,8 +220,9 @@ class ShortTermMemory:
             for ts, text in buckets["today"]:
                 local_ts = ts.astimezone()
                 time_str = local_ts.strftime("%H:%M")
+                clean = _TIME_PREFIX_RE.sub("", text)
                 lines.append(f"<!-- {ts.isoformat()} -->")
-                lines.append(f"- [{time_str}] {text}")
+                lines.append(f"- [{time_str}] {clean}")
             sections.append("\n".join(lines))
 
         if buckets["yesterday"]:
@@ -260,6 +260,111 @@ class ShortTermMemory:
         rendered = self._render(existing)
         self._write(rendered)
         logger.debug("ShortTermMemory: appended entry (total={})", len(existing))
+
+    # ------------------------------------------------------------------
+    # Backfill from raw logs
+    # ------------------------------------------------------------------
+
+    async def backfill(self, raw_dir: Path, provider: LLMProvider, model: str) -> None:
+        """Seed SHORT_TERM.md from raw JSONL logs if it doesn't exist yet.
+
+        Scans ``raw_dir/*.jsonl`` for files within the retention window,
+        summarises each day via the LLM, and writes the result.
+        """
+        if self.file.exists() and self.file.stat().st_size > 0:
+            logger.debug("ShortTermMemory: backfill skipped — file already exists")
+            return
+
+        if not raw_dir.is_dir():
+            logger.debug("ShortTermMemory: backfill skipped — raw dir missing")
+            return
+
+        now = datetime.now(timezone.utc)
+        cutoff = now - timedelta(days=self.retention_days)
+
+        # Collect JSONL files within retention window
+        jsonl_files: list[Path] = []
+        for path in sorted(raw_dir.glob("*.jsonl")):
+            try:
+                file_date = datetime.strptime(path.stem, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if file_date >= cutoff:
+                jsonl_files.append(path)
+
+        if not jsonl_files:
+            logger.debug("ShortTermMemory: backfill skipped — no recent raw logs")
+            return
+
+        entries: list[tuple[datetime, str]] = []
+        for path in jsonl_files:
+            try:
+                result = await self._summarise_raw_day(path, provider, model)
+                if result:
+                    entries.append(result)
+            except Exception:
+                logger.warning("ShortTermMemory: backfill failed for {}", path.name, exc_info=True)
+
+        if entries:
+            rendered = self._render(entries)
+            self._write(rendered)
+            logger.info("ShortTermMemory: backfilled {} day(s) from raw logs", len(entries))
+        else:
+            logger.debug("ShortTermMemory: backfill produced no entries")
+
+    async def _summarise_raw_day(
+        self, path: Path, provider: LLMProvider, model: str
+    ) -> tuple[datetime, str] | None:
+        """Read a single day's JSONL and return ``(utc_timestamp, summary)``."""
+        lines = path.read_text(encoding="utf-8").strip().splitlines()
+        messages: list[str] = []
+        first_utc: datetime | None = None
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            role = rec.get("role", "")
+            content = rec.get("content", "")
+            if not (isinstance(content, str) and content.strip()):
+                continue
+            # Parse real UTC timestamp and convert to local for display
+            ts_str = rec.get("ts", "")
+            try:
+                utc_ts = datetime.fromisoformat(ts_str)
+                local_ts = utc_ts.astimezone()
+                local_time = local_ts.strftime("%H:%M")
+                if first_utc is None:
+                    first_utc = utc_ts
+            except (ValueError, TypeError):
+                local_time = "??:??"
+            messages.append(f"[{local_time}] {role.upper()}: {content[:500]}")
+
+        if not messages or first_utc is None:
+            return None
+
+        transcript = "\n".join(messages[-60:])  # last 60 messages to stay within limits
+
+        prompt = (
+            f"Summarise this day's conversation into one concise paragraph. "
+            f"Do NOT include a timestamp prefix. "
+            f"Preserve key topics, decisions, and outcomes. Be brief.\n\n{transcript}"
+        )
+        response = await provider.chat_with_retry(
+            messages=[
+                {"role": "system", "content": "You are a memory consolidation agent. Produce a brief summary."},
+                {"role": "user", "content": prompt},
+            ],
+            model=model,
+        )
+        text = (response.content or "").strip()
+        if not text:
+            return None
+        # Strip any timestamp prefix the LLM may have added despite instructions
+        m = _TIMESTAMP_RE.match(text)
+        if m:
+            text = text[m.end():].strip()
+        return first_utc, text
 
     # ------------------------------------------------------------------
     # Compression

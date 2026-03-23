@@ -86,7 +86,9 @@ class TestAppendAndRender:
 
     def test_on_new_entry_appends_to_file(self, tmp_path: Path) -> None:
         stm = ShortTermMemory(tmp_path)
-        stm.on_new_entry("[2026-03-22 14:30] User discussed testing.")
+        now = datetime.now()
+        ts = now.strftime("%Y-%m-%d %H:%M")
+        stm.on_new_entry(f"[{ts}] User discussed testing.")
         assert stm.file.exists()
         content = stm.file.read_text()
         assert "User discussed testing" in content
@@ -99,8 +101,11 @@ class TestAppendAndRender:
 
     def test_multiple_entries_same_day(self, tmp_path: Path) -> None:
         stm = ShortTermMemory(tmp_path)
-        stm.on_new_entry("[2026-03-22 14:00] First entry.")
-        stm.on_new_entry("[2026-03-22 15:00] Second entry.")
+        now = datetime.now()
+        ts1 = now.strftime("%Y-%m-%d %H:%M")
+        ts2 = (now + timedelta(hours=1)).strftime("%Y-%m-%d %H:%M")
+        stm.on_new_entry(f"[{ts1}] First entry.")
+        stm.on_new_entry(f"[{ts2}] Second entry.")
         content = stm.file.read_text()
         assert "First entry" in content
         assert "Second entry" in content
@@ -217,3 +222,120 @@ class TestCompress:
         provider.chat_with_retry.assert_called_once()
         content = stm.read()
         assert "Compressed week summary" in content
+
+
+class TestBackfill:
+    """Test backfill from raw JSONL logs."""
+
+    @staticmethod
+    def _write_jsonl(raw_dir: Path, date_str: str, messages: list[dict], hour_utc: int = 12) -> None:
+        """Helper: write messages to a raw JSONL file with real UTC timestamps."""
+        import json as _json
+
+        path = raw_dir / f"{date_str}.jsonl"
+        with open(path, "w", encoding="utf-8") as f:
+            for i, msg in enumerate(messages):
+                ts = f"{date_str}T{hour_utc:02d}:{i:02d}:00+00:00"
+                rec = {"v": 1, "ts": ts, "session_key": "test:1", **msg}
+                f.write(_json.dumps(rec) + "\n")
+
+    @pytest.mark.asyncio
+    async def test_backfill_seeds_from_raw_jsonl(self, tmp_path: Path) -> None:
+        """Backfill should create SHORT_TERM.md from raw JSONL files."""
+        stm = ShortTermMemory(tmp_path)
+        raw_dir = tmp_path / "memory" / "raw"
+        raw_dir.mkdir(parents=True)
+
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        utc_hour = 6
+        self._write_jsonl(raw_dir, today, [
+            {"role": "user", "content": "How do I fix the auth bug?"},
+            {"role": "assistant", "content": "Check the middleware token validation."},
+        ], hour_utc=utc_hour)
+
+        # LLM returns plain text (no timestamp prefix) — backfill pairs it with real UTC ts
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(
+            return_value=LLMResponse(content="Discussed auth bug fix in middleware.")
+        )
+
+        await stm.backfill(raw_dir, provider, "test-model")
+
+        assert stm.file.exists()
+        content = stm.read()
+        assert "auth bug" in content
+        provider.chat_with_retry.assert_called_once()
+        # Verify the prompt included local timestamps in the transcript
+        call_args = provider.chat_with_retry.call_args
+        prompt_content = call_args.kwargs.get("messages", call_args[1].get("messages", [{}]))[-1]["content"]
+        local_hour = datetime(2026, 1, 1, utc_hour, 0, tzinfo=timezone.utc).astimezone().strftime("%H:%M")
+        assert local_hour in prompt_content
+
+    @pytest.mark.asyncio
+    async def test_backfill_skips_when_file_exists(self, tmp_path: Path) -> None:
+        """Backfill should be a no-op if SHORT_TERM.md already has content."""
+        stm = ShortTermMemory(tmp_path)
+        stm._write("## Today\n- Existing entry.\n")
+
+        raw_dir = tmp_path / "memory" / "raw"
+        raw_dir.mkdir(parents=True)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        self._write_jsonl(raw_dir, today, [
+            {"role": "user", "content": "Hello"},
+        ])
+
+        provider = AsyncMock()
+        await stm.backfill(raw_dir, provider, "test-model")
+
+        provider.chat_with_retry.assert_not_called()
+        assert "Existing entry" in stm.read()
+
+    @pytest.mark.asyncio
+    async def test_backfill_respects_retention_days(self, tmp_path: Path) -> None:
+        """JSONL files older than retention_days should be ignored."""
+        stm = ShortTermMemory(tmp_path, retention_days=3)
+        raw_dir = tmp_path / "memory" / "raw"
+        raw_dir.mkdir(parents=True)
+
+        old_date = (datetime.now(timezone.utc) - timedelta(days=10)).strftime("%Y-%m-%d")
+        self._write_jsonl(raw_dir, old_date, [
+            {"role": "user", "content": "Old conversation"},
+        ])
+
+        provider = AsyncMock()
+        await stm.backfill(raw_dir, provider, "test-model")
+
+        assert not stm.file.exists()
+        provider.chat_with_retry.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_backfill_handles_llm_failure(self, tmp_path: Path) -> None:
+        """If LLM fails for one day, other days should still be processed."""
+        stm = ShortTermMemory(tmp_path)
+        raw_dir = tmp_path / "memory" / "raw"
+        raw_dir.mkdir(parents=True)
+
+        now = datetime.now(timezone.utc)
+        day1 = (now - timedelta(days=1)).strftime("%Y-%m-%d")
+        day2 = now.strftime("%Y-%m-%d")
+
+        self._write_jsonl(raw_dir, day1, [{"role": "user", "content": "Day 1 chat"}])
+        self._write_jsonl(raw_dir, day2, [{"role": "user", "content": "Day 2 chat"}])
+
+        call_count = 0
+
+        async def mock_chat(**kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                raise RuntimeError("LLM unavailable")
+            return LLMResponse(content="Day 2 summary.")
+
+        provider = AsyncMock()
+        provider.chat_with_retry = AsyncMock(side_effect=mock_chat)
+
+        await stm.backfill(raw_dir, provider, "test-model")
+
+        assert stm.file.exists()
+        content = stm.read()
+        assert "Day 2 summary" in content
