@@ -53,8 +53,23 @@ class Tool(ABC):
         """JSON Schema for tool parameters."""
         pass
 
+    @property
+    def read_only(self) -> bool:
+        """Whether this tool is side-effect free and safe to parallelize."""
+        return False
+
+    @property
+    def concurrency_safe(self) -> bool:
+        """Whether this tool can run alongside other concurrency-safe tools."""
+        return self.read_only and not self.exclusive
+
+    @property
+    def exclusive(self) -> bool:
+        """Whether this tool should run alone even if concurrency is enabled."""
+        return False
+
     @abstractmethod
-    async def execute(self, **kwargs: Any) -> str:
+    async def execute(self, **kwargs: Any) -> Any:
         """
         Execute the tool with given parameters.
 
@@ -62,7 +77,7 @@ class Tool(ABC):
             **kwargs: Tool-specific parameters.
 
         Returns:
-            String result of the tool execution.
+            Result of the tool execution (string or list of content blocks).
         """
         pass
 
@@ -146,7 +161,9 @@ class Tool(ABC):
 
     def _validate(self, val: Any, schema: dict[str, Any], path: str) -> list[str]:
         raw_type = schema.get("type")
-        nullable = isinstance(raw_type, list) and "null" in raw_type
+        nullable = (isinstance(raw_type, list) and "null" in raw_type) or schema.get(
+            "nullable", False
+        )
         t, label = self._resolve_type(raw_type), path or "parameter"
         if nullable and val is None:
             return []
