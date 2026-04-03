@@ -216,7 +216,7 @@ class ShortTermMemory:
         sections: list[str] = []
 
         if buckets["today"]:
-            lines = ["## Today"]
+            lines = ["## 今天"]
             for ts, text in buckets["today"]:
                 local_ts = ts.astimezone()
                 time_str = local_ts.strftime("%H:%M")
@@ -226,13 +226,13 @@ class ShortTermMemory:
             sections.append("\n".join(lines))
 
         if buckets["yesterday"]:
-            sections.append(self._render_date_range_section("Yesterday", buckets["yesterday"]))
+            sections.append(self._render_date_range_section("昨天", buckets["yesterday"]))
 
         if buckets["this_week"]:
-            sections.append(self._render_date_range_section("This Week", buckets["this_week"]))
+            sections.append(self._render_date_range_section("本周", buckets["this_week"]))
 
         if buckets["older"]:
-            sections.append(self._render_date_range_section("Older", buckets["older"]))
+            sections.append(self._render_date_range_section("更早", buckets["older"]))
 
         return "\n\n".join(sections) + "\n" if sections else ""
 
@@ -346,13 +346,13 @@ class ShortTermMemory:
         transcript = "\n".join(messages[-60:])  # last 60 messages to stay within limits
 
         prompt = (
-            f"Summarise this day's conversation into one concise paragraph. "
-            f"Do NOT include a timestamp prefix. "
-            f"Preserve key topics, decisions, and outcomes. Be brief.\n\n{transcript}"
+            f"将这一天的对话总结为一段简洁的摘要。"
+            f"不要添加时间戳前缀。"
+            f"保留关键话题、决策和结果。尽量简短。\n\n{transcript}"
         )
         response = await provider.chat_with_retry(
             messages=[
-                {"role": "system", "content": "You are a memory consolidation agent. Produce a brief summary."},
+                {"role": "system", "content": "你是一个记忆整理助手。生成简短的摘要。"},
                 {"role": "user", "content": prompt},
             ],
             model=model,
@@ -407,8 +407,8 @@ class ShortTermMemory:
             system_msg = {
                 "role": "system",
                 "content": (
-                    "Compress entries into concise paragraph. "
-                    "Preserve key decisions, open tasks, outcomes. Be brief."
+                    "将条目压缩为简洁的一段话。"
+                    "保留关键决策、待办事项和结果。尽量简短。"
                 ),
             }
             user_msg = {"role": "user", "content": bullet_list}

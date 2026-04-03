@@ -87,14 +87,9 @@ class _LoopHook(AgentHook):
 
     async def before_execute_tools(self, context: AgentHookContext) -> None:
         if self._on_progress:
-            if not self._on_stream:
-                thought = self._loop._strip_think(
-                    context.response.content if context.response else None
-                )
-                if thought:
-                    await self._on_progress(thought)
             tool_hint = self._loop._strip_think(self._loop._tool_hint(context.tool_calls))
-            await self._on_progress(tool_hint, tool_hint=True)
+            if tool_hint:
+                await self._on_progress(tool_hint, tool_hint=True)
         for tc in context.tool_calls:
             args_str = json.dumps(tc.arguments, ensure_ascii=False)
             logger.info("Tool call: {}({})", tc.name, args_str[:200])
@@ -413,9 +408,8 @@ class AgentLoop:
             {
                 "role": "system",
                 "content": (
-                    "Summarize the following background task result for the user "
-                    "in 1-2 sentences. Be natural and concise. Do not mention "
-                    "technical details like subagents or task IDs."
+                    "用1-2句话自然简洁地总结以下后台任务结果。"
+                    "不要提及子代理或任务ID等技术细节。"
                 ),
             },
             {"role": "user", "content": content},

@@ -40,7 +40,7 @@ class ContextBuilder:
             if memory:
                 memory_parts.append(memory)
             if short_term:
-                memory_parts.append(f"## Recent Activity\n{short_term}")
+                memory_parts.append(f"## 近期动态\n{short_term}")
             parts.append("# Memory\n\n" + "\n\n".join(memory_parts))
 
         always_skills = self.skills.get_always_skills()

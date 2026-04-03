@@ -64,5 +64,5 @@ class TestShortTermIntegration:
         prompt = ctx.build_system_prompt()
 
         assert "User likes Python" in prompt
-        assert "Recent Activity" in prompt
+        assert "近期动态" in prompt
         assert "Debugged auth issue" in prompt

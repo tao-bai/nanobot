@@ -92,7 +92,7 @@ class TestAppendAndRender:
         assert stm.file.exists()
         content = stm.file.read_text()
         assert "User discussed testing" in content
-        assert "## Today" in content
+        assert "## 今天" in content
 
     def test_on_new_entry_skips_raw(self, tmp_path: Path) -> None:
         stm = ShortTermMemory(tmp_path)
@@ -109,7 +109,7 @@ class TestAppendAndRender:
         content = stm.file.read_text()
         assert "First entry" in content
         assert "Second entry" in content
-        assert content.count("## Today") == 1  # only one header
+        assert content.count("## 今天") == 1  # only one header
 
     def test_read_returns_empty_when_no_file(self, tmp_path: Path) -> None:
         stm = ShortTermMemory(tmp_path)
@@ -193,13 +193,13 @@ class TestCompress:
         now = datetime.now(timezone.utc)
         stm._write(stm._render([(now, "Today's entry.")], now=now))
         content_before = stm.read()
-        assert "## Today" in content_before
+        assert "## 今天" in content_before
 
         # Re-render with now = tomorrow
         tomorrow = now + timedelta(days=1)
         entries = stm._read_entries()
         rendered = stm._render(entries, now=tomorrow)
-        assert "## Yesterday" in rendered
+        assert "## 昨天" in rendered
 
     @pytest.mark.asyncio
     async def test_compress_triggers_llm_for_many_entries_in_tier(self, tmp_path: Path) -> None:

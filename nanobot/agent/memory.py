@@ -150,18 +150,18 @@ class MemoryStore:
             return True
 
         current_memory = self.read_long_term()
-        prompt = f"""Process this conversation and call the save_memory tool with exactly these two arguments:
-- history_entry: A paragraph summarizing key events/decisions/topics. Start with [YYYY-MM-DD HH:MM].
-- memory_update: Full updated long-term memory as markdown. Include all existing facts plus new ones. Return unchanged if nothing new.
+        prompt = f"""处理这段对话，调用 save_memory 工具并传入以下两个参数：
+- history_entry: 一段总结关键事件/决策/话题的摘要。以 [YYYY-MM-DD HH:MM] 开头。用对话使用的语言书写。
+- memory_update: 完整更新后的长期记忆（markdown 格式）。包含所有已有事实和新增内容。如无新内容则原样返回。
 
-## Current Long-term Memory
-{current_memory or "(empty)"}
+## 当前长期记忆
+{current_memory or "（空）"}
 
-## Conversation to Process
+## 待处理对话
 {self._format_messages(messages)}"""
 
         chat_messages = [
-            {"role": "system", "content": "You are a memory consolidation agent. You MUST call the save_memory tool with EXACTLY two arguments: history_entry and memory_update. Do not use any other field names."},
+            {"role": "system", "content": "你是一个记忆整理助手。你必须调用 save_memory 工具，传入恰好两个参数：history_entry 和 memory_update。不要使用其他字段名。"},
             {"role": "user", "content": prompt},
         ]
 

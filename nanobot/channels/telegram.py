@@ -508,7 +508,11 @@ class TelegramChannel(BaseChannel):
             except Exception as e:
                 if self._is_not_modified_error(e):
                     logger.debug("Final stream edit already applied for {}", chat_id)
-                    self._stream_bufs.pop(chat_id, None)
+                    if meta.get("_resuming"):
+                        buf.text = ""
+                        buf.stream_id = None
+                    else:
+                        self._stream_bufs.pop(chat_id, None)
                     return
                 logger.debug("Final stream edit failed (HTML), trying plain: {}", e)
                 try:
@@ -520,11 +524,21 @@ class TelegramChannel(BaseChannel):
                 except Exception as e2:
                     if self._is_not_modified_error(e2):
                         logger.debug("Final stream plain edit already applied for {}", chat_id)
-                        self._stream_bufs.pop(chat_id, None)
+                        if meta.get("_resuming"):
+                            buf.text = ""
+                            buf.stream_id = None
+                        else:
+                            self._stream_bufs.pop(chat_id, None)
                         return
                     logger.warning("Final stream edit failed: {}", e2)
                     raise  # Let ChannelManager handle retry
-            self._stream_bufs.pop(chat_id, None)
+            # When resuming (tool call follows), keep the message_id so the next
+            # segment edits the same Telegram message instead of creating a new one.
+            if meta.get("_resuming"):
+                buf.text = ""
+                buf.stream_id = None
+            else:
+                self._stream_bufs.pop(chat_id, None)
             return
 
         buf = self._stream_bufs.get(chat_id)
